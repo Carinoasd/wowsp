@@ -28,7 +28,6 @@ import { useRouter } from "vue-router";
 import type { ArenaInfo, OverlayStatus, VehicleEntry } from "@/api";
 import { api } from "@/api";
 import { useAccountStore } from "@/stores/account";
-import { useOverlayStore } from "@/stores/overlay";
 import { useLanguage } from "@/i18n/useLanguage";
 import { t } from "@/i18n";
 import { shipNameFromOfflineDb } from "@/features/holographic/modelLoader";
@@ -118,12 +117,6 @@ export default defineComponent({
     // (a panel that never used overlay mode stays badge-free).
     const overlayStatus = ref<OverlayStatus | null>(null);
     let unlistenStatus: (() => void) | null = null;
-    // In-game Tab row order, streamed by the same watcher whenever a
-    // recognition pass over a held Tab frame matched the roster. Held in
-    // the overlay store (survives this panel unmounting mid-battle); the
-    // columns below reorder to mirror the on-screen table exactly,
-    // sunk-ship grouping included.
-    const overlay = useOverlayStore();
     // Per-battle trusted sunk sets (sink-attrib events name WHO sank by
     // strip-fingerprint matching) — feed the predicted order below so the
     // columns mirror the game's [alive] ++ [sunk] layout live.
@@ -146,7 +139,6 @@ export default defineComponent({
         sunk: sunk.sunkNames(side),
       };
     };
-    let unlistenTabOrder: (() => void) | null = null;
     let unlistenSinkAttrib: (() => void) | null = null;
     /** The side's believed alive order for resolving sink-attrib rows:
      *  the predicted key order minus the trusted sunk set. */
@@ -160,7 +152,7 @@ export default defineComponent({
           : (props.arena?.vehicles ?? []).filter((v) =>
               side === "enemy" ? v.relation > 1 : v.relation <= 1,
             );
-      const order = orderForTab(list, null, predictedOptionsFor(side)).map(
+      const order = orderForTab(list, predictedOptionsFor(side)).map(
         (e) => e.vehicle.name,
       );
       const names = sunk.sunkNames(side);
@@ -169,9 +161,6 @@ export default defineComponent({
     onMounted(async () => {
       unlistenStatus = (await api.listenOverlayStatus((s) => {
         overlayStatus.value = s;
-      })) as (() => void) | null;
-      unlistenTabOrder = (await api.listenTabOrder((o) => {
-        overlay.applyTabOrder(o);
       })) as (() => void) | null;
       unlistenSinkAttrib = (await api.listenSinkAttribution((a) => {
         sunk.applyAttribution(
@@ -184,8 +173,6 @@ export default defineComponent({
     onBeforeUnmount(() => {
       unlistenStatus?.();
       unlistenStatus = null;
-      unlistenTabOrder?.();
-      unlistenTabOrder = null;
       unlistenSinkAttrib?.();
       unlistenSinkAttrib = null;
       if (shakeTimer) {
@@ -206,11 +193,6 @@ export default defineComponent({
       }
       if (s.state === "idle") return null;
       if (s.state === "detected") {
-        // A sink just reshuffled the anchored rows and the watcher is
-        // re-mapping them at the accelerated cadence — badge "updating"
-        // instead of the row count until the mapping lands (stale clears).
-        if (s.stale)
-          return { cls: "detected", spin: true, text: t("replay.live.updating") };
         return {
           cls: "detected",
           spin: false,
@@ -272,13 +254,6 @@ export default defineComponent({
         props.arena?.vehicles.map((v) => v.name),
       ),
     );
-    const tabRowsFor = (side: "allies" | "enemies") => {
-      const order = overlay.tabOrder;
-      if (!order || !props.arena?.dateTime || order.dateTime !== props.arena.dateTime) {
-        return null;
-      }
-      return side === "allies" ? order.allies : order.enemies;
-    };
     // Inputs for the predicted order's full Tab key come from
     // `predictedOptionsFor` above (locale + clan tag + that side's trusted
     // sunk set) — the orders re-derive reactively when the WG batch lands a
@@ -288,7 +263,6 @@ export default defineComponent({
         operation.value
           ? props.arena?.vehicles ?? []
           : props.arena?.vehicles.filter((v) => v.relation <= 1) ?? [],
-        tabRowsFor("allies"),
         predictedOptionsFor("ally"),
       ),
     );
@@ -297,7 +271,6 @@ export default defineComponent({
         operation.value
           ? []
           : props.arena?.vehicles.filter((v) => v.relation > 1) ?? [],
-        tabRowsFor("enemies"),
         predictedOptionsFor("enemy"),
       ),
     );

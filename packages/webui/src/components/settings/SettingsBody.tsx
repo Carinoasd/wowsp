@@ -175,29 +175,6 @@ export default defineComponent({
 
     const lang = useLanguage();
     const overlayCfg = useOverlayConfigStore();
-    // Windows OCR availability (an installed OCR language pack): the `ocr`
-    // roster mode is exact but needs the OS engine — on systems where it was
-    // stripped the option stays VISIBLE but disabled, so the user understands
-    // why the preferred inferred mode is the only working pick besides off.
-    // A stored `ocr` pick on such a machine falls back to inferred: the
-    // backend leaves the pipeline dormant there, so keeping the value would
-    // only promise chips the shell cannot deliver.
-    const ocrAvailable = ref(true);
-    onMounted(async () => {
-      try {
-        ocrAvailable.value = await api.overlayOcrAvailable();
-      } catch {
-        // missing command (mobile stand-in / old shell) — assume unusable so
-        // the default inferred mode stays the obvious choice
-        ocrAvailable.value = false;
-      }
-      if (!ocrAvailable.value) {
-        await overlayCfg.load();
-        if (overlayCfg.roster === "ocr") {
-          void overlayCfg.setRoster("inferred");
-        }
-      }
-    });
     const router = useRouter();
     // Phone-app build gate (desktop layout can still be narrow — that is
     // isMobile/isPhoneLayout, a different axis; see utils/platform).
@@ -1773,11 +1750,9 @@ export default defineComponent({
               switches (radio-style so a future "plugin" mode can join each
               later without schema churn): table anchoring pixel-detects the
               team table, and its off state disables the WHOLE Tab overlay;
-              roster attribution picks the rule-inferred mapping (the
-              default — no OCR at all), the OCR pipeline (exact; offered
-              only when the OS engine is usable — a system with the OCR
-              language pack stripped keeps the option visible but disabled),
-              or the roster/index order fallback. The note under the first
+              roster attribution picks the derived mapping (the
+              default — the game's own Tab sort key plus the sink solver,
+              no OCR at all) or the roster/index order fallback. The note under the first
               switch explains why exclusive fullscreen can't work.
               Unreachable on the phone app build (no overlay window there —
               the rail filters the section out). */}
@@ -1806,17 +1781,9 @@ export default defineComponent({
                 }
                 tabs={[
                   { key: "inferred", label: t("settings.overlayRosterInferred") },
-                  {
-                    key: "ocr",
-                    label: t("settings.overlayRosterOcr"),
-                    disabled: !ocrAvailable.value,
-                  },
                   { key: "off", label: t("settings.overlayRosterOff") },
                 ]}
               />
-              {!ocrAvailable.value ? (
-                <HkSettingsHint>{t("settings.overlayRosterOcrUnavailable")}</HkSettingsHint>
-              ) : null}
             </HkSettingsSub>
           </HkSettingsGroup>
 

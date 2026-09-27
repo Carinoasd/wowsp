@@ -1,12 +1,10 @@
 //! Opt-in ground-truth dumps of the in-game Tab roster (debug aid).
 //!
-//! The overlay frontend currently maps `tempArenaInfo.json` players onto the
-//! detected table rows by array index, but the in-game Tab panel orders its
-//! rows with its own sort — so the chips can land on the wrong player. The
-//! planned fix ("row → name recognition") needs GROUND TRUTH: the exact Tab
-//! frame, the arena roster the frontend indexed, and the detector output, all
-//! captured at the same instant, so the REAL row order can be analysed
-//! offline.
+//! The overlay's row attribution is pixel-derived (the Tab sort key plus
+//! the sink solver's strip fingerprints), so its development needs GROUND
+//! TRUTH: the exact Tab frame, the arena roster of that instant, and the
+//! detector output, all captured together for offline analysis of the REAL
+//! row order and the strip fingerprints' behavior.
 //!
 //! The dump only runs when the developer sets `WOWSP_TAB_DUMP_DIR` to a
 //! non-empty path — it is a debugging feature, never a shipped behavior, and
@@ -24,10 +22,10 @@
 //! MOVES as a whole within one battle — the countdown "waiting players"
 //! layout sits ~190 px above the combat layout once the in-battle HUD
 //! appears — the first-row bucket changes and the new layout takes its own
-//! dump. Those per-layout frames are exactly the ground truth the
-//! row-recognition engine needs: the same battle captured under different
-//! panel layouts (row-order sampling across survival states is the
-//! recognition PR's own work). FAILED detections (the centered-fallback
+//! dump. Those per-layout frames are exactly the ground truth the strip
+//! fingerprinting needs: the same battle captured under different panel
+//! layouts (row-order sampling across survival states is the sink
+//! solver's own work). FAILED detections (the centered-fallback
 //! anchor behind the "table not found" hint) dump once per battle as
 //! `.miss.` artifacts — a scenario where the detector cannot find the table
 //! leaves its frame behind for offline analysis instead of vanishing. Every
@@ -44,14 +42,6 @@ use wowsp_tauri_shared::{ArenaInfo, OverlayAnchor};
 
 /// Environment variable that enables the dumps (set to a directory path).
 const TAB_DUMP_DIR_ENV: &str = "WOWSP_TAB_DUMP_DIR";
-
-/// Per-row RAW recognized text of the most recent recognition pass, aligned
-/// 1:1 with the anchor's `row_centers`. Stashed by [`stash_row_texts`] only
-/// while the dump gate is on, so a `.rows.json` artifact can carry what the
-/// OCR engine actually saw next to the names the matcher made of it — the two
-/// together are what answers "why did THIS row not match?" offline (raw text
-/// and crop geometry included, from the frame artifact written beside it).
-static LAST_ROW_TEXTS: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
 
 /// Signatures of every (battle, layout) already dumped — a seen-SET, not a
 /// last-write slot: the phase refinement moves the grid by up to ±pitch/3
@@ -127,22 +117,6 @@ pub(crate) fn maybe_dump_tab_frame(rgba: &[u8], width: u32, height: u32, anchor:
     }
 }
 
-/// Whether the dump gate is on right now. The recognition pass asks BEFORE
-/// stashing the raw row texts, so a build without `WOWSP_TAB_DUMP_DIR` pays
-/// one env read per pass and never touches the stash (the shipped hot path
-/// stays allocation-free).
-pub(crate) fn dump_enabled() -> bool {
-    dump_dir(std::env::var_os(TAB_DUMP_DIR_ENV)).is_some()
-}
-
-/// Stash the raw per-row recognized texts for the next dump. Poisoned by a
-/// panic elsewhere — stay silent and leave the overlay flow untouched.
-pub(crate) fn stash_row_texts(texts: &[Option<String>]) {
-    if let Ok(mut slot) = LAST_ROW_TEXTS.lock() {
-        *slot = texts.to_vec();
-    }
-}
-
 /// Record `signature` in the seen-set and report whether it was new (the
 /// caller should dump). Poisoned by a panic elsewhere — stay silent and
 /// leave the overlay flow untouched.
@@ -187,10 +161,10 @@ fn first_dump_for_battle(seen: &mut Vec<u64>, signature: u64) -> bool {
 /// tempArenaInfo.json path with a new dateTime/roster, so every real battle
 /// hashes differently; the panel moving as a WHOLE inside one battle (the
 /// countdown → combat HUD phase shift) changes the bucket and takes its own
-/// dump — per-layout ground truth for the recognition engine. Row REORDERS
+/// dump — per-layout ground truth for the strip analysis. Row REORDERS
 /// at fixed slot positions (sunk ships) do not move the first row and are
-/// deliberately not part of this signature — sampling those is the
-/// recognition PR's own work.
+/// deliberately not part of this signature — sampling those is the sink
+/// solver tests' own work.
 fn battle_signature(info: &ArenaInfo, first_row_bucket: i64) -> u64 {
     let mut hasher = DefaultHasher::new();
     info.date_time.hash(&mut hasher);
@@ -248,10 +222,7 @@ fn encode_frame_png(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// - `tab-<stem><variant>.frame.png` — the game-window frame the detector
 ///   ran on;
 /// - `tab-<stem><variant>.arena.json` — tempArenaInfo.json's raw JSON text;
-/// - `tab-<stem><variant>.anchor.json` — the serialized [`OverlayAnchor`];
-/// - `tab-<stem><variant>.rows.json` — the raw recognized text per row, when
-///   a recognition pass for THIS row count stashed one (the OCR's own view,
-///   beside the names the matcher made of it).
+/// - `tab-<stem><variant>.anchor.json` — the serialized [`OverlayAnchor`].
 ///
 /// All share the timestamp stem; `variant` is `""` for a confirmed detection
 /// and `".miss"` for a failed one. File names carry no player name, but the
@@ -283,22 +254,6 @@ fn write_dump_files(
         anchor_json,
     )
     .map_err(|e| format!("write anchor json: {e}"))?;
-    // The raw texts belong to ONE recognition pass — the OCR mode's. A
-    // non-OCR anchor (inferred derives its names without OCR; off names
-    // nothing) must not pair with a stash a previous OCR pass left behind,
-    // and neither should a row count that disagrees with the anchor's grid
-    // (a miss detection never runs recognition). Omit rather than write a
-    // misleading artifact.
-    let texts = LAST_ROW_TEXTS.lock().map(|t| t.clone()).unwrap_or_default();
-    if anchor.roster_mode == "ocr" && texts.len() == anchor.row_centers.len() {
-        let rows_json =
-            serde_json::to_string_pretty(&texts).map_err(|e| format!("serialize rows: {e}"))?;
-        std::fs::write(
-            dir.join(format!("tab-{stem}{variant}.rows.json")),
-            rows_json,
-        )
-        .map_err(|e| format!("write rows json: {e}"))?;
-    }
     Ok(())
 }
 
@@ -385,10 +340,7 @@ mod tests {
             row_centers: vec![first, first + 52, first + 104],
             team_split: 0.5,
             table_detected: true,
-            row_players: None,
             row_alive: None,
-            row_players_pending: false,
-            stale: false,
             roster_mode: String::new(),
         }
     }
@@ -515,10 +467,7 @@ mod tests {
             row_centers: vec![50, 92, 134],
             team_split: 0.5,
             table_detected: true,
-            row_players: None,
             row_alive: None,
-            row_players_pending: false,
-            stale: false,
             roster_mode: String::new(),
         };
         let arena_text = r#"{"dateTime":"20260917T120000","vehicles":[{"id":11}]}"#;
