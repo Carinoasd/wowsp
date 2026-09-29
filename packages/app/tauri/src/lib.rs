@@ -472,6 +472,8 @@ pub fn run() {
             commands::mod_hub::mod_hub_uninstall_unit,
             commands::mod_hub::mod_hub_stale_versions,
             commands::mod_hub::mod_hub_migrate_stale_bin,
+            commands::mod_hub::mod_hub_migration_plan,
+            commands::mod_hub::mod_hub_migration_execute,
             commands::mod_hub::mod_hub_safe_mode,
             commands::mod_hub::mod_hub_set_safe_mode,
             commands::mod_catalog::mod_hub_reconcile,
@@ -482,6 +484,9 @@ pub fn run() {
             commands::mod_install::install_overlay_mod,
             commands::mod_install::uninstall_overlay_mod,
             commands::mod_install::is_overlay_mod_installed,
+            commands::ingame_plugin::ingame_plugin_status,
+            commands::ingame_plugin::ingame_plugin_install,
+            commands::ingame_plugin::ingame_plugin_uninstall,
             commands::ranked::get_ranked_stats,
             // Changelog feed for the settings' 更新日志 section — GitHub
             // Releases via the mirror ladder; platform-neutral (the phone

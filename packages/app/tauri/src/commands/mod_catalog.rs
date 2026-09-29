@@ -196,6 +196,9 @@ struct RawVersion {
     name_zh: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// Ships inside the WoWSP app — listed without download packages.
+    #[serde(default)]
+    bundled: Option<bool>,
     #[serde(default)]
     i18n: std::collections::HashMap<String, RawI18n>,
     /// Present in the publisher index; not rendered in-app (CSP blocks the
@@ -267,7 +270,10 @@ fn parse_index(raw: &serde_json::Value) -> Result<CatalogIndex, String> {
                 }
             })
             .collect();
-        if packages.is_empty() {
+        // Entries with no packages ship inside the app itself (the in-game
+        // stats plugin is the first) — they stay listed, marked
+        // bundled-installed by the UI, and are not downloadable.
+        if !ver.bundled.unwrap_or(false) && packages.is_empty() {
             continue;
         }
         mods.push(CatalogEntry {
@@ -276,6 +282,7 @@ fn parse_index(raw: &serde_json::Value) -> Result<CatalogIndex, String> {
             discussion: m.discussion,
             version: latest,
             game: ver.game.clone().unwrap_or_else(|| "*".into()),
+            bundled: ver.bundled.unwrap_or(false),
             title: ver.title.clone().unwrap_or_else(|| id.clone()),
             name_zh: ver.name_zh.clone().unwrap_or_default(),
             name_en: ver
@@ -1415,6 +1422,35 @@ mod tests {
         assert_eq!(m.packages[0].size, 10);
         assert_eq!(m.i18n.len(), 2, "both locales survive the round-trip");
         assert_eq!(m.i18n["ja-JP"].name, "射撃後タイマー");
+    }
+
+    #[test]
+    fn bundled_entries_survive_without_packages() {
+        let raw = serde_json::json!({
+            "schema": 1,
+            "mods": {
+                "battle.ingame.stats": {
+                    "id": "battle.ingame.stats",
+                    "category": "battle",
+                    "discussion": 640,
+                    "latest": "0.1.0",
+                    "versions": {
+                        "0.1.0": {
+                            "game": "*",
+                            "title": "In-Game Tab Stats Plugin",
+                            "bundled": true
+                        }
+                    }
+                },
+                "still-dropped": {"latest": "1", "versions": {"1": {"title": "no packages, no flag"}}}
+            }
+        });
+        let index = parse_index(&raw).unwrap();
+        assert_eq!(index.mods.len(), 1, "only the bundled entry survives");
+        let m = &index.mods[0];
+        assert_eq!(m.id, "battle.ingame.stats");
+        assert!(m.bundled, "bundled flag reaches the DTO");
+        assert!(m.packages.is_empty(), "no download packages to offer");
     }
 
     #[test]

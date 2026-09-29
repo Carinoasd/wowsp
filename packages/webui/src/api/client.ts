@@ -1079,6 +1079,8 @@ export interface CatalogEntry {
   version: string;
   /** Game-version range as published, e.g. `>=15.7 <15.8`. */
   game: string;
+  /** Ships inside the WoWSP app — listed, not downloadable. */
+  bundled?: boolean;
   title: string;
   nameZh: string;
   nameEn: string;
@@ -1131,6 +1133,28 @@ export interface MigrateReport {
   toVersion: string;
   movedFiles: number;
   skippedFiles: number;
+}
+
+/** One stale-tree file in a migration plan — res_mods-relative, forward
+ *  slashes. `identity` is the display name when the backend resolved one
+ *  (always absent today: the webui matches catalog ids / Aslain dir
+ *  aliases itself, see features/modhub/migrateIdentity.ts). */
+export interface PlanFile {
+  path: string;
+  size: number;
+  identity?: string | null;
+}
+
+/** The migration wizard's pre-flight classification of one stale bin:
+ *  duplicates (identical content already in the destination) and superseded
+ *  files (same path, different content — the newer copy wins) are deleted;
+ *  `decide` files are stale-only and follow the user's per-file choice. */
+export interface MigrationPlan {
+  fromVersion: string;
+  toVersion: string;
+  duplicate: PlanFile[];
+  superseded: PlanFile[];
+  decide: PlanFile[];
 }
 
 /** What a ledger reconciliation cleaned up (ghost records, orphan
@@ -1329,6 +1353,15 @@ export const api = {
   getOverlayConfig: () => transport.invoke<{ table: string; roster: string }>(RPC.get_overlay_config),
   setOverlayConfig: (table: string, roster: string) =>
     transport.invoke<{ table: string; roster: string }>(RPC.set_overlay_config, { table, roster }),
+  /** In-game stats plugin presence in a game install (see
+   * commands/ingame_plugin.rs) — powers the roster "plugin detection"
+   * option's enabled state and its Discussions page link. */
+  ingamePluginStatus: (gameRoot: string) =>
+    transport.invoke<{ installed: boolean; resMods: string; discussion: number }>(RPC.ingame_plugin_status, { gameRoot }),
+  ingamePluginInstall: (gameRoot: string) =>
+    transport.invoke<string>(RPC.ingame_plugin_install, { gameRoot }),
+  ingamePluginUninstall: (gameRoot: string) =>
+    transport.invoke<null>(RPC.ingame_plugin_uninstall, { gameRoot }),
   /** Remembered game-install path — sanitized + persisted as TOML by the
    *  shell (see commands/game_config.rs). */
   getGameConfig: () => transport.invoke<{ activePath: string | null }>(RPC.get_game_config),
@@ -1642,6 +1675,21 @@ export const api = {
     transport.invoke<MigrateReport>(RPC.mod_hub_migrate_stale_bin, {
       gameRoot,
       fromVersion,
+    }),
+  /** Migration wizard step 1: classify the stale tree into duplicate /
+   *  superseded / decide buckets (read-only). */
+  modHubMigrationPlan: (gameRoot: string, fromVersion: string) =>
+    transport.invoke<MigrationPlan>(RPC.mod_hub_migration_plan, {
+      gameRoot,
+      fromVersion,
+    }),
+  /** Migration wizard step 2: apply the reviewed plan — `keep` lists the
+   *  decide paths to carry over, everything else is cleaned up. */
+  modHubMigrationExecute: (gameRoot: string, fromVersion: string, keep: string[]) =>
+    transport.invoke<MigrateReport>(RPC.mod_hub_migration_execute, {
+      gameRoot,
+      fromVersion,
+      keep,
     }),
   /** Is safe mode visible (current res_mods quarantined, or a stranded
    *  twin in an old version dir)? */
