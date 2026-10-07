@@ -39,3 +39,7 @@ The desktop build restricts telemetry to the feature-usage signals above and
 no collection happens before you complete the first-run wizard. Because the
 app is fully open source, the telemetry code paths can be reviewed in the
 repository at any time.
+
+To turn telemetry off, open **Settings → About → Usage Telemetry** and
+switch off **Send usage telemetry**. Sending stops immediately and the
+choice is remembered across launches.

@@ -138,6 +138,8 @@
   "overlayFullscreenNote": "※ 独占全屏下无法显示：该模式下 Windows GDI 截屏只能捕获黑帧，覆盖窗口也无法叠加在全屏交换链之上。请在游戏设置中将显示模式改为“无边框”或“窗口化”。",
   "attributions": "支持与致谢",
   "telemetryTitle": "使用量遥测",
+  "telemetryToggle": "发送使用统计",
+  "telemetryToggleDesc": "向 Google Analytics 发送匿名的页面浏览与界面语言。关闭后立即停止发送。",
   "account": "账户",
   "accountHint": "当前账户用于「我的水表」与战绩查询。点击卡片切换，点击「新增玩家」绑定新账户。",
   "statsSection": "战绩",

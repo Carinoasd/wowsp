@@ -25,6 +25,7 @@ import { sameGamePath } from "@/utils/gamePath";
 import AnnouncementContent from "./AnnouncementContent";
 import FontSizeControl from "@/components/layout/FontSizeControl";
 import StatsPrefsControls from "@/components/stats/StatsPrefsControls";
+import { initAnalytics } from "@/utils/analytics";
 import "./OnboardingWizard.scss";
 
 /** Completion marker — its absence (first launch AND pre-wizard installs)
@@ -204,6 +205,9 @@ export default defineComponent({
         // storage unavailable — wizard would re-show next launch, which is
         // the safe failure mode for an ack we could not persist
       }
+      // Telemetry starts only now (initAnalytics() skipped at boot while
+      // the wizard was pending; it re-checks the completed key itself).
+      initAnalytics();
       emit("update:modelValue", false);
     }
 
