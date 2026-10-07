@@ -28,6 +28,11 @@
 //! `WoWSP_<version>_x64-installer-lite.exe` (see `artifact_url`: an app
 //! update never re-ships the resource pack, which updates through its own
 //! channel) under each mirror base.
+//! Before any byte is accepted, the installer's sha256 is read from the
+//! official release API (`api.github.com`, never a mirror — the `digest`
+//! GitHub computes for every release asset) and the hub verifies the
+//! stream against it; no reachable digest or a mismatch on every mirror
+//! means no installer is spawned.
 //! The hardened installer kills the running app and installs over its
 //! directory, so the frontend treats the command's promise never resolving
 //! (app death) or resolving (installer spawned) as success by design; the
@@ -91,7 +96,81 @@ const JOB_ID: &str = "update";
 /// installer is only worth downloading on a fresh install.
 fn artifact_url(base: &str, version: &str) -> String {
     let base = base.trim().trim_end_matches('/');
-    format!("{base}/WoWSP_{version}_x64-installer-lite.exe")
+    format!("{base}/{}", artifact_name(version))
+}
+
+/// The bare installer asset name for a release (see [`artifact_url`]).
+fn artifact_name(version: &str) -> String {
+    format!("WoWSP_{version}_x64-installer-lite.exe")
+}
+
+// ── Artifact integrity (official digest) ─────────────────────────────────
+
+/// The official release API for one tag. Deliberately NOT routed through
+/// `github_mirror`: the digest is the trust anchor for installer bytes that
+/// may stream from third-party mirrors, so it must come from GitHub itself
+/// — a mirror able to serve both the artifact and its hash could forge both.
+fn release_api_url(version: &str) -> String {
+    format!("https://api.github.com/repos/langyo/wowsp/releases/tags/v{version}")
+}
+
+/// Per-attempt cap on the digest lookup (the payload is a few KB).
+const DIGEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Attempts at the digest lookup before the update is refused.
+const DIGEST_ATTEMPTS: usize = 3;
+
+/// The lowercase sha256 GitHub computed for asset `name` in a release-API
+/// payload (`"digest": "sha256:<hex>"`). `None` when the asset is missing,
+/// carries no digest, or the digest is not a well-formed sha256.
+fn asset_sha256(release: &serde_json::Value, name: &str) -> Option<String> {
+    let hex = release["assets"]
+        .as_array()?
+        .iter()
+        .find(|asset| asset["name"].as_str() == Some(name))?["digest"]
+        .as_str()?
+        .strip_prefix("sha256:")?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// Fetch the official sha256 of the installer for `version`. Any failure
+/// is an `Err`: an installer that cannot be verified is never spawned.
+async fn fetch_official_sha256(client: &reqwest::Client, version: &str) -> Result<String, String> {
+    let url = release_api_url(version);
+    let name = artifact_name(version);
+    let mut last_err = String::new();
+    for _ in 0..DIGEST_ATTEMPTS {
+        let response = client
+            .get(&url)
+            .header("User-Agent", "WoWSP-updater")
+            .header("Accept", "application/vnd.github+json")
+            .timeout(DIGEST_TIMEOUT)
+            .send()
+            .await;
+        let release: serde_json::Value = match response {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = format!("parse {url}: {e}");
+                    continue;
+                },
+            },
+            Ok(r) => {
+                last_err = format!("{url}: HTTP {}", r.status());
+                continue;
+            },
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                continue;
+            },
+        };
+        return asset_sha256(&release, &name)
+            .ok_or_else(|| format!("release v{version} publishes no sha256 digest for {name}"));
+    }
+    Err(format!(
+        "cannot verify the update (official digest unavailable: {last_err}); download it manually from GitHub Releases"
+    ))
 }
 
 /// The parsed update-watch config (mirrors `shun::config::UpdateWatchConfig`;
@@ -401,6 +480,9 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
         .filter(|c| c.version == version)
         .map(|c| artifact_url(&c.base, &version))
         .collect();
+    // The official digest is fetched straight from api.github.com before a
+    // single mirror byte is accepted; without it the update is refused.
+    let expected_sha256 = fetch_official_sha256(&client, &version).await?;
     tracing::info!(%version, racers = sources.len(), "update download starting");
 
     // Version-scoped, pid-suffixed temp name: the part survives failed
@@ -424,10 +506,13 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
             race_window: Some(RACE_WINDOW),
             resume: true,
             cancel_msg: CANCEL_MSG.to_string(),
-            // No sha exists for the installer artifact (mirrors publish
-            // none), but the transfer stays bounded anyway: an unbounded
-            // stream would head-of-line-block every later hub job
-            // (pack / mods / data pack) behind a dead connection.
+            // Verified streaming against GitHub's own digest: a mirror
+            // serving tampered or truncated bytes fails the check and the
+            // hub moves on to the next candidate.
+            expected_sha256: Some(expected_sha256),
+            // The transfer stays bounded: an unbounded stream would
+            // head-of-line-block every later hub job (pack / mods / data
+            // pack) behind a dead connection.
             timeout: Some(Duration::from_secs(7200)),
             ..DownloadRequest::new(JOB_ID, kind::UPDATE, sources, part_path)
         },
@@ -636,6 +721,81 @@ mod tests {
             version_from_redirect("https://example.test/tag/"),
             None,
             "empty tag name"
+        );
+    }
+
+    #[test]
+    fn release_api_url_targets_github_directly() {
+        // The digest source must never be a mirror prefix.
+        assert_eq!(
+            release_api_url("0.5.4"),
+            "https://api.github.com/repos/langyo/wowsp/releases/tags/v0.5.4"
+        );
+    }
+
+    #[test]
+    fn asset_sha256_picks_the_lite_installer_digest() {
+        let hex = "5c25dea369c26b8889c1a0dcd8697d0de6f138c12a68721e47479cd9c675116d";
+        let release = serde_json::json!({
+            "assets": [
+                { "name": "latest", "digest": "sha256:8878893c4e9b58612d5d96a468552e495493152ae49a02196c9af550c556e71d" },
+                { "name": "WoWSP_0.5.4_x64-installer-lite.exe", "digest": format!("sha256:{}", hex.to_uppercase()) },
+                { "name": "WoWSP_0.5.4_x64-installer.exe", "digest": "sha256:05ba4ab13167014d9ed80f99e4ba5d191b20c859b98689425433075dbe779577" },
+            ]
+        });
+        assert_eq!(
+            asset_sha256(&release, &artifact_name("0.5.4")),
+            Some(hex.to_string()),
+            "matched by exact name and normalized to lowercase"
+        );
+    }
+
+    #[test]
+    fn asset_sha256_rejects_missing_or_malformed_digests() {
+        let name = artifact_name("0.5.4");
+        let with_digest = |digest: serde_json::Value| serde_json::json!({ "assets": [{ "name": name, "digest": digest }] });
+        assert_eq!(
+            asset_sha256(&serde_json::json!({}), &name),
+            None,
+            "no assets"
+        );
+        assert_eq!(
+            asset_sha256(&serde_json::json!({ "assets": [{ "name": name }] }), &name),
+            None,
+            "asset without a digest"
+        );
+        assert_eq!(
+            asset_sha256(&with_digest(serde_json::Value::Null), &name),
+            None
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest("md5:d41d8cd98f00b204e9800998ecf8427e".into()),
+                &name
+            ),
+            None,
+            "non-sha256 algorithm"
+        );
+        assert_eq!(
+            asset_sha256(&with_digest("sha256:abc".into()), &name),
+            None,
+            "short"
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest(format!("sha256:{}", "z".repeat(64)).into()),
+                &name
+            ),
+            None,
+            "non-hex"
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest(format!("sha256:{}", "a".repeat(64)).into()),
+                "other.exe"
+            ),
+            None,
+            "other asset name"
         );
     }
 }
