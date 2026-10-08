@@ -167,12 +167,44 @@ pub fn dedupe_path(dir: &Path, name: &str) -> PathBuf {
     ))
 }
 
-/// Write replay bytes into the managed dir: sanitize → dedupe → write.
-/// Returns the final local path.
+/// Atomically claim a free name. A name selected before a download (or an
+/// import on another blocking thread) is only a hint, never permission to
+/// replace a file that appeared in the meantime.
+fn reserve_replay_file(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), String> {
+    for _ in 0..1000 {
+        let path = dedupe_path(dir, name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create {}: {e}", path.display())),
+        }
+    }
+    Err("could not reserve a unique replay file name".into())
+}
+
+fn write_replay_file(
+    dir: &Path,
+    name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    let (path, mut file) = reserve_replay_file(dir, name)?;
+    let result = write(&mut file);
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("write {}: {e}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Write replay bytes into a newly reserved file in the managed dir.
 fn store_replay_bytes(dir: &Path, raw_name: &str, bytes: &[u8]) -> Result<String, String> {
     let name = sanitize_replay_name(raw_name)?;
-    let path = dedupe_path(dir, &name);
-    std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let path = write_replay_file(dir, &name, |file| std::io::Write::write_all(file, bytes))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -427,7 +459,7 @@ pub async fn pairing_pull_replay(
     }
     let local_name = sanitize_replay_name(&remote_name)?;
     let dir = managed_replays_dir()?;
-    let final_path = dedupe_path(&dir, &local_name);
+    let final_path = dir.join(&local_name);
     let seq = part_seq();
     let part = final_path.with_file_name(format!(
         "{}.{seq}.part",
@@ -474,8 +506,29 @@ pub async fn pairing_pull_replay(
     }
 }
 
+/// Copy a completed download into a newly reserved file. Both files live in
+/// the replay directory, but a no-replace hard link is not available on every
+/// supported filesystem (for example removable game drives).
+fn finalize_replay_part(part: &Path, proposed_path: &Path) -> Result<PathBuf, String> {
+    let dir = proposed_path.parent().ok_or("missing replay directory")?;
+    let name = proposed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid replay file name")?;
+    let mut source =
+        std::fs::File::open(part).map_err(|e| format!("read {}: {e}", part.display()))?;
+    let result = write_replay_file(dir, name, |dest| {
+        std::io::copy(&mut source, dest).map(|_| ())
+    });
+    drop(source);
+    if result.is_ok() {
+        let _ = std::fs::remove_file(part);
+    }
+    result
+}
+
 /// Shared tail of both pull paths: finalize the `.part` file, emit the
-/// terminal progress event, clean up on failure.
+/// terminal progress event, clean up on failure (including finalization).
 async fn finish_replay_pull(
     app: AppHandle,
     received: Result<u64, String>,
@@ -483,10 +536,20 @@ async fn finish_replay_pull(
     final_path: PathBuf,
     remote_name: String,
 ) -> Result<PairingPathResult, String> {
-    match received {
+    let result = match received {
         Ok(n) => {
-            std::fs::rename(&part, &final_path)
-                .map_err(|e| format!("finalize {}: {e}", final_path.display()))?;
+            let source = part.clone();
+            tokio::task::spawn_blocking(move || finalize_replay_part(&source, &final_path))
+                .await
+                .map_err(|e| format!("replay finalization task failed: {e}"))
+                .and_then(|result| result)
+                .map(|path| (n, path))
+        },
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(&part);
+    match result {
+        Ok((n, final_path)) => {
             emit_progress(
                 &app,
                 &PairingProgress {
@@ -503,7 +566,6 @@ async fn finish_replay_pull(
             })
         },
         Err(e) => {
-            let _ = std::fs::remove_file(&part);
             emit_progress(
                 &app,
                 &PairingProgress {
@@ -2226,6 +2288,84 @@ pub(crate) mod tests {
         // A smuggled path lands as the basename.
         let p3 = store_replay_bytes(&tmp, "C:\\games\\20250622_b.wowsreplay", b"b").unwrap();
         assert!(p3.ends_with("20250622_b.wowsreplay"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn replay_pulls_with_colliding_names_preserve_both_downloads() {
+        let tmp = tempfile_dir();
+        // Both transfers selected the same destination before either finished.
+        let proposed = tmp.join("same.wowsreplay");
+        let first = tmp.join("same.1.part");
+        let second = tmp.join("same.2.part");
+        std::fs::write(&first, b"first replay").unwrap();
+        std::fs::write(&second, b"second replay").unwrap();
+        let first_path = finalize_replay_part(&first, &proposed).unwrap();
+        let second_path = finalize_replay_part(&second, &proposed).unwrap();
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"first replay");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"second replay");
+        assert_ne!(first_path, second_path);
+        assert!(!first.exists() && !second.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn replay_pull_preserves_file_created_during_download() {
+        let tmp = tempfile_dir();
+        let proposed = tmp.join("same.wowsreplay");
+        let part = tmp.join("same.1.part");
+        std::fs::write(&part, b"downloaded replay").unwrap();
+        // A normal game recording or file import lands while the pull runs.
+        std::fs::write(&proposed, b"local recording").unwrap();
+        let downloaded = finalize_replay_part(&part, &proposed).unwrap();
+        assert_eq!(std::fs::read(&proposed).unwrap(), b"local recording");
+        assert_eq!(std::fs::read(&downloaded).unwrap(), b"downloaded replay");
+        assert_ne!(downloaded, proposed);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn replay_write_failure_removes_only_its_reserved_file() {
+        let tmp = tempfile_dir();
+        let existing = tmp.join("same.wowsreplay");
+        std::fs::write(&existing, b"existing replay").unwrap();
+        let result = write_replay_file(&tmp, "same.wowsreplay", |file| {
+            std::io::Write::write_all(file, b"incomplete")?;
+            Err(std::io::Error::other("simulated storage failure"))
+        });
+        assert!(result.unwrap_err().contains("simulated storage failure"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing replay");
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn replay_parallel_writers_claim_different_files() {
+        let tmp = tempfile_dir();
+        let barrier = std::sync::Barrier::new(2);
+        let paths = std::thread::scope(|scope| {
+            let writers: Vec<_> = [b"first replay".as_slice(), b"second replay".as_slice()]
+                .into_iter()
+                .map(|bytes| {
+                    let dir = &tmp;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        write_replay_file(dir, "same.wowsreplay", |file| {
+                            barrier.wait();
+                            std::io::Write::write_all(file, bytes)
+                        })
+                        .unwrap()
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"first replay");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"second replay");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
