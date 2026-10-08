@@ -35,5 +35,20 @@ fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by cargo");
     std::fs::write(out_dir.join("app-version.txt"), version).expect("write embedded app version");
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Tauri embeds Common Controls v6 in the app binary's resources,
+        // but its resource link argument does not reach library unit tests.
+        // Tests that retain dialog code otherwise fail before main with
+        // STATUS_ENTRYPOINT_NOT_FOUND (TaskDialogIndirect). This produces
+        // an adjacent manifest for test executables that cargo runs in place.
+        // Do not add /MANIFEST:EMBED: the app already has manifest resource #1.
+        // rustc-link-arg-tests cannot be used here: it excludes lib unit tests.
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    }
+
     tauri_build::build()
 }
