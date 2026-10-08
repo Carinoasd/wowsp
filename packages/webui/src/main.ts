@@ -34,7 +34,7 @@ bootstrap();
 initAnalytics();
 // Forward SPA route changes as page_views on the virtual canonical host.
 router.afterEach((to) => {
-  trackPageView(String(to.name ?? to.path), to.fullPath);
+  trackPageView(to.path);
 });
 const app = createApp(App);
 app.use(createPinia());

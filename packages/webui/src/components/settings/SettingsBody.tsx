@@ -89,7 +89,7 @@ import { useLanguage } from "@/i18n/useLanguage";
 import { api, type GameInstall, type NetworkConfig } from "@/api";
 import { formatEta, formatSpeed } from "@/utils/format";
 import { isMobileApp, isTauri } from "@/utils/platform";
-import { isAnalyticsEnabled, setAnalyticsEnabled } from "@/utils/analytics";
+import { analyticsEnabled, setAnalyticsEnabled } from "@/utils/analytics";
 import { useRouter } from "vue-router";
 import { useConfigStore } from "@/stores/config";
 import { usePluginUpdatesStore } from "@/stores/pluginUpdates";
@@ -165,12 +165,6 @@ export default defineComponent({
   setup(props) {
     const ui = useSettingsUiStore();
     const closeBehavior = useCloseBehaviorStore();
-    /** Settings → About telemetry switch (utils/analytics persists it). */
-    const telemetryOn = ref(isAnalyticsEnabled());
-    function onTelemetryToggle(on: boolean) {
-      telemetryOn.value = on;
-      setAnalyticsEnabled(on);
-    }
     const pluginPrompt = usePluginPromptStore();
     const theme = useTheme();
     const wallpaper = useWallpaper();
@@ -2286,7 +2280,7 @@ export default defineComponent({
                 <span class="stats-prefs__row-label">{t("settings.telemetryToggle")}</span>
                 <span class="stats-prefs__row-desc">{t("settings.telemetryToggleDesc")}</span>
               </span>
-              <HkSwitch modelValue={telemetryOn.value} onUpdate:modelValue={onTelemetryToggle} />
+              <HkSwitch modelValue={analyticsEnabled.value} onUpdate:modelValue={setAnalyticsEnabled} />
             </div>
           </HkSettingsGroup>
           </>
