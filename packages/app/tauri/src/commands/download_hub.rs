@@ -50,6 +50,17 @@ use super::network::build_http_client;
 /// both run on this clock so the webview isn't flooded per chunk.
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
+/// Existing hub callers share an atomic cancellation flag. Poll it while
+/// awaiting network I/O as well, so a stalled peer cannot hide a cancel
+/// until the (potentially two-hour) request timeout.
+const CANCEL_TICK: Duration = Duration::from_millis(25);
+
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(CANCEL_TICK).await;
+    }
+}
+
 /// Smoothing factor for the displayed download speed (EWMA over the
 /// per-tick bytes/sec samples).
 const SPEED_EWMA_ALPHA: f64 = 0.3;
@@ -88,7 +99,7 @@ pub struct DownloadRequest {
     /// Ceiling on the transfer (data-pack cap); `None` = unbounded.
     pub max_bytes: Option<u64>,
     /// sha256 of the WHOLE file; verified streaming (prefix included
-    /// when resuming). A mismatch deletes the part — the bytes cannot be
+    /// when resuming). A mismatch truncates the part — the bytes cannot be
     /// trusted, the next pass starts clean.
     pub expected_sha256: Option<String>,
     /// Per-request total cap (reqwest `timeout` covers the whole request
@@ -246,7 +257,7 @@ pub async fn transfer(
 }
 
 /// Flag the queued or running job(s) under `(kind, id)` for
-/// cancellation. The running attempt stops at the next chunk boundary,
+/// cancellation. The running attempt interrupts pending network I/O,
 /// keeps its part file (resume base for a later retry) and fails with
 /// the request's `cancel_msg`; a still-queued job fails the moment it is
 /// dequeued. When no job is registered yet — the caller's resolve phase
@@ -497,7 +508,11 @@ async fn run_transfer(
 
     let sources = match req.race_window.filter(|_| req.sources.len() > 1) {
         Some(window) => {
-            race_reorder(&client, &req.sources, committed, window, app.as_ref(), &req).await
+            tokio::select! {
+                biased;
+                () = cancelled(&cancel) => return Err(req.cancel_msg.clone()),
+                sources = race_reorder(&client, &req.sources, committed, window, app.as_ref(), &req) => sources,
+            }
         },
         None => req.sources.clone(),
     };
@@ -537,9 +552,11 @@ async fn run_transfer(
                             &got[..got.len().min(12)]
                         );
                         // The bytes on disk (resume prefix included) are
-                        // untrustworthy: drop the whole part so the next
-                        // candidate restarts from byte 0 clean.
-                        let _ = tokio::fs::remove_file(&req.part).await;
+                        // untrustworthy: empty the part before resetting
+                        // the hasher. Ignoring a failed delete (e.g. a
+                        // Windows scanner holding a deny-delete handle)
+                        // would append clean bytes after an unhashed prefix.
+                        truncate_part(&req.part, 0).await?;
                         committed = 0;
                         hasher = Sha256::new();
                         tracker.reset();
@@ -618,7 +635,11 @@ async fn attempt(
     if let Some(timeout) = req.timeout {
         request = request.timeout(timeout);
     }
-    let mut response = request.send().await.map_err(|e| format!("{url}: {e}"))?;
+    let mut response = tokio::select! {
+        biased;
+        () = cancelled(cancel) => return Err(req.cancel_msg.clone()),
+        response = request.send() => response.map_err(|e| format!("{url}: {e}"))?,
+    };
     let status = response.status();
 
     let mut local_restarted = false;
@@ -707,7 +728,15 @@ async fn attempt(
             drop(file);
             return Err(req.cancel_msg.clone());
         }
-        match response.chunk().await {
+        let next_chunk = tokio::select! {
+            biased;
+            () = cancelled(cancel) => {
+                let _ = file.flush().await;
+                return Err(req.cancel_msg.clone());
+            },
+            chunk = response.chunk() => chunk,
+        };
+        match next_chunk {
             Ok(Some(chunk)) => {
                 if let Some(max) = req.max_bytes {
                     if *committed + chunk.len() as u64 > max {
@@ -895,6 +924,124 @@ async fn hash_prefix(part: &Path, len: u64, hasher: &mut Sha256) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wowsp-hub-test-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_body_and_keeps_the_prefix() {
+        let dir = test_directory();
+        let part = dir.join("update.part");
+        let prefix = b"downloaded prefix";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/installer", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(prefix).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut req = DownloadRequest::new("stall", "update", vec![url], part.clone());
+        req.timeout = Some(Duration::from_secs(60));
+        let stop = async {
+            while tokio::fs::metadata(&part)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0)
+                < prefix.len() as u64
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(run_transfer(None, req, Arc::clone(&cancel)), stop)
+        })
+        .await;
+        server.abort();
+        let (result, ()) = outcome.expect("cancellation must wake a stalled response body");
+        assert_eq!(result.unwrap_err(), "download cancelled");
+        assert_eq!(tokio::fs::read(&part).await.unwrap(), prefix);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mismatch_clears_untrusted_bytes_even_when_windows_denies_deletion() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = test_directory();
+        let part = dir.join("update.part");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            // Permit reads/writes but omit FILE_SHARE_DELETE, as a scanner can.
+            .share_mode(0x1 | 0x2)
+            .open(&part)
+            .unwrap();
+        let good = b"official installer bytes";
+        let bad = b"untrusted executable prefix";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in [bad.as_slice(), good.as_slice()] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut req = DownloadRequest::new(
+            "digest",
+            "update",
+            vec![format!("{base}/bad"), format!("{base}/good")],
+            part.clone(),
+        );
+        req.expected_sha256 = Some(hex::encode(Sha256::digest(good)));
+        req.timeout = Some(Duration::from_secs(3));
+        let done = run_transfer(None, req, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(done.bytes, good.len() as u64);
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            good,
+            "verified bytes must be the entire on-disk installer"
+        );
+        server.await.unwrap();
+        drop(locked);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn content_range_parses_shapes() {
