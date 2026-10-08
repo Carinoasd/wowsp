@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,17 @@ use super::network::build_http_client;
 /// both run on this clock so the webview isn't flooded per chunk.
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
+/// Existing hub callers share an atomic cancellation flag. Poll it while
+/// awaiting network I/O as well, so a stalled peer cannot hide a cancel
+/// until the (potentially two-hour) request timeout.
+const CANCEL_TICK: Duration = Duration::from_millis(25);
+
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(CANCEL_TICK).await;
+    }
+}
+
 /// Smoothing factor for the displayed download speed (EWMA over the
 /// per-tick bytes/sec samples).
 const SPEED_EWMA_ALPHA: f64 = 0.3;
@@ -65,6 +76,10 @@ static HUB_BUSY: AtomicBool = AtomicBool::new(false);
 /// Monotonic job-key counter — cancels address jobs by id, several jobs
 /// may share an id over time (mod packages reuse the entry id).
 static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const JOB_QUEUED: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_CANCELLED: u8 = 2;
 
 // ── Public request shape ──────────────────────────────────────────────────
 
@@ -88,7 +103,7 @@ pub struct DownloadRequest {
     /// Ceiling on the transfer (data-pack cap); `None` = unbounded.
     pub max_bytes: Option<u64>,
     /// sha256 of the WHOLE file; verified streaming (prefix included
-    /// when resuming). A mismatch deletes the part — the bytes cannot be
+    /// when resuming). A mismatch truncates the part — the bytes cannot be
     /// trusted, the next pass starts clean.
     pub expected_sha256: Option<String>,
     /// Per-request total cap (reqwest `timeout` covers the whole request
@@ -178,6 +193,9 @@ struct Job {
     req: DownloadRequest,
     app: Option<AppHandle>,
     cancel: Arc<AtomicBool>,
+    /// Only the winner of QUEUED -> RUNNING may start a writer. A caller
+    /// that wins QUEUED -> CANCELLED can return before the worker is free.
+    state: Arc<AtomicU8>,
     waiter: tokio::sync::oneshot::Sender<Result<TransferDone, String>>,
     /// Registry key — distinct from `req.id` so repeated ids (mod
     /// packages) never collide in the cancel map.
@@ -192,9 +210,19 @@ pub async fn transfer(
     app: Option<&AppHandle>,
     req: DownloadRequest,
 ) -> Result<TransferDone, String> {
-    let hub = hub();
-    let (waiter, done) = tokio::sync::oneshot::channel();
+    transfer_on(hub(), app, req).await
+}
+
+/// The same queue protocol with a caller-owned worker for isolated tests.
+async fn transfer_on(
+    hub: &Hub,
+    app: Option<&AppHandle>,
+    req: DownloadRequest,
+) -> Result<TransferDone, String> {
+    let (waiter, mut done) = tokio::sync::oneshot::channel();
     let cancel = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(AtomicU8::new(JOB_QUEUED));
+    let cancel_msg = req.cancel_msg.clone();
     let key = format!(
         "{}/{}#{}",
         req.kind,
@@ -206,8 +234,7 @@ pub async fn transfer(
     }
     // Consume a cancel pressed while this pass was still resolving
     // (probes / manifest fetches run before the job is queued): the job
-    // dies the moment the worker dequeues it, like the static flag the
-    // old per-command engines used.
+    // fails without waiting for unrelated downloads ahead of it.
     {
         let scope = format!("{}/{}", req.kind, req.id);
         let consumed = match pending_cancels().lock() {
@@ -227,7 +254,8 @@ pub async fn transfer(
     let sent = hub.tx.send(Job {
         req,
         app: app.cloned(),
-        cancel,
+        cancel: Arc::clone(&cancel),
+        state: Arc::clone(&state),
         waiter,
         key: key.clone(),
     });
@@ -239,18 +267,39 @@ pub async fn transfer(
         }
         return Err("download hub worker is gone".to_string());
     }
-    match done.await {
+    let result = tokio::select! {
+        result = &mut done => result,
+        () = cancelled(&cancel) => {
+            if state.compare_exchange(
+                JOB_QUEUED,
+                JOB_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).is_ok() {
+                // The queued tombstone cannot start a writer. Remove only
+                // this attempt so it cannot absorb a retry's pending cancel.
+                if let Ok(mut map) = cancels().lock() {
+                    map.remove(&key);
+                }
+                return Err(cancel_msg);
+            }
+            // A writer already owns the part file. Do not release the
+            // caller until that writer has stopped and dropped its file.
+            done.await
+        }
+    };
+    match result {
         Ok(result) => result,
         Err(_) => Err("download job was dropped by the hub worker".to_string()),
     }
 }
 
 /// Flag the queued or running job(s) under `(kind, id)` for
-/// cancellation. The running attempt stops at the next chunk boundary,
+/// cancellation. The running attempt interrupts pending network I/O,
 /// keeps its part file (resume base for a later retry) and fails with
-/// the request's `cancel_msg`; a still-queued job fails the moment it is
-/// dequeued. When no job is registered yet — the caller's resolve phase
-/// (version probes, manifest fetches) runs BEFORE `transfer` — the
+/// the request's `cancel_msg`; a still-queued job fails without waiting
+/// for the active download. When no job is registered yet — the caller's
+/// resolve phase (version probes, manifest fetches) runs BEFORE `transfer` — the
 /// request is remembered and consumed by the next `transfer` under the
 /// same key, so a cancel pressed during resolution is never lost.
 /// The kind scopes the match: a mod-hub entry literally named "update"
@@ -298,6 +347,17 @@ pub fn clear_pending(kind: &str, id: &str) {
 
 async fn worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>) {
     while let Some(job) = rx.recv().await {
+        if job
+            .state
+            .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if let Ok(mut map) = cancels().lock() {
+                map.remove(&job.key);
+            }
+            let _ = job.waiter.send(Err(job.req.cancel_msg));
+            continue;
+        }
         HUB_BUSY.store(true, Ordering::SeqCst);
         // Run the body in its own task: a panic inside one download must
         // fail that job, not kill the queue (every later job would hang).
@@ -497,7 +557,11 @@ async fn run_transfer(
 
     let sources = match req.race_window.filter(|_| req.sources.len() > 1) {
         Some(window) => {
-            race_reorder(&client, &req.sources, committed, window, app.as_ref(), &req).await
+            tokio::select! {
+                biased;
+                () = cancelled(&cancel) => return Err(req.cancel_msg.clone()),
+                sources = race_reorder(&client, &req.sources, committed, window, app.as_ref(), &req) => sources,
+            }
         },
         None => req.sources.clone(),
     };
@@ -537,9 +601,11 @@ async fn run_transfer(
                             &got[..got.len().min(12)]
                         );
                         // The bytes on disk (resume prefix included) are
-                        // untrustworthy: drop the whole part so the next
-                        // candidate restarts from byte 0 clean.
-                        let _ = tokio::fs::remove_file(&req.part).await;
+                        // untrustworthy: empty the part before resetting
+                        // the hasher. Ignoring a failed delete (e.g. a
+                        // Windows scanner holding a deny-delete handle)
+                        // would append clean bytes after an unhashed prefix.
+                        truncate_part(&req.part, 0).await?;
                         committed = 0;
                         hasher = Sha256::new();
                         tracker.reset();
@@ -618,7 +684,11 @@ async fn attempt(
     if let Some(timeout) = req.timeout {
         request = request.timeout(timeout);
     }
-    let mut response = request.send().await.map_err(|e| format!("{url}: {e}"))?;
+    let mut response = tokio::select! {
+        biased;
+        () = cancelled(cancel) => return Err(req.cancel_msg.clone()),
+        response = request.send() => response.map_err(|e| format!("{url}: {e}"))?,
+    };
     let status = response.status();
 
     let mut local_restarted = false;
@@ -707,7 +777,15 @@ async fn attempt(
             drop(file);
             return Err(req.cancel_msg.clone());
         }
-        match response.chunk().await {
+        let next_chunk = tokio::select! {
+            biased;
+            () = cancelled(cancel) => {
+                let _ = file.flush().await;
+                return Err(req.cancel_msg.clone());
+            },
+            chunk = response.chunk() => chunk,
+        };
+        match next_chunk {
             Ok(Some(chunk)) => {
                 if let Some(max) = req.max_bytes {
                     if *committed + chunk.len() as u64 > max {
@@ -895,6 +973,272 @@ async fn hash_prefix(part: &Path, len: u64, hasher: &mut Sha256) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wowsp-hub-test-{}-{}",
+            std::process::id(),
+            JOB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn running_cancellation_waits_for_worker_completion() {
+        let scope = format!("test-running-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub { tx };
+        let req = DownloadRequest::new("running", &scope, Vec::new(), PathBuf::new());
+        let mut transfer = Box::pin(transfer_on(&hub, None, req));
+        assert!(futures::poll!(transfer.as_mut()).is_pending());
+        // Hold the worker's completion acknowledgment after it has claimed
+        // this job, as a writer still dropping its file would do.
+        let job = rx.try_recv().unwrap();
+        job.state
+            .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap();
+        cancel(&scope, "running");
+        tokio::time::sleep(CANCEL_TICK * 2).await;
+        assert!(futures::poll!(transfer.as_mut()).is_pending());
+        assert!(cancels().lock().unwrap().contains_key(&job.key));
+        cancels().lock().unwrap().remove(&job.key);
+        job.waiter
+            .send(Err("writer has stopped".to_string()))
+            .unwrap();
+        assert_eq!(transfer.await.unwrap_err(), "writer has stopped");
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_releases_the_waiter_without_starting_a_writer() {
+        let dir = test_directory();
+        let first_part = dir.join("first.part");
+        let queued_part = dir.join("queued.part");
+        let scope = format!("test-queue-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release_first, released) = tokio::sync::oneshot::channel();
+        let (started, first_started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npre")
+                .await
+                .unwrap();
+            started.send(()).unwrap();
+            released.await.unwrap();
+            socket.write_all(b"fix").await.unwrap();
+            socket.shutdown().await.unwrap();
+            // No cancelled job may reach the network after dequeue.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /retry-success "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub { tx };
+        let worker = tokio::spawn(worker(rx));
+        let first = DownloadRequest::new(
+            "first",
+            &scope,
+            vec![format!("{base}/first")],
+            first_part.clone(),
+        );
+        let mut first = Box::pin(transfer_on(&hub, None, first));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(3), first_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let request = |path: &str| {
+            DownloadRequest::new(
+                "retry",
+                &scope,
+                vec![format!("{base}/{path}")],
+                queued_part.clone(),
+            )
+        };
+        let mut second = Box::pin(transfer_on(&hub, None, request("cancelled")));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        cancel(&scope, "retry");
+        let result = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("queued cancel must finish before the unrelated writer is released");
+        assert_eq!(result.unwrap_err(), "download cancelled");
+        assert!(!queued_part.exists());
+        assert!(
+            cancels()
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with(&format!("{scope}/retry#")))
+        );
+
+        // A retry has its own registry key. It must neither inherit the old
+        // cancel nor lose a new click to the cancelled queue tombstone.
+        let mut retry = Box::pin(transfer_on(&hub, None, request("retry-cancelled")));
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        tokio::time::sleep(CANCEL_TICK * 2).await;
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        cancel(&scope, "retry");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            "download cancelled"
+        );
+        assert!(!queued_part.exists());
+
+        // A cancel during retry resolution must become pending even while
+        // the old cancelled jobs remain in the worker's queue.
+        cancel(&scope, "retry");
+        let retry = transfer_on(&hub, None, request("cancelled-during-resolution"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            "download cancelled"
+        );
+        assert!(!queued_part.exists());
+
+        let mut successful_retry = Box::pin(transfer_on(&hub, None, request("retry-success")));
+        assert!(futures::poll!(successful_retry.as_mut()).is_pending());
+        release_first.send(()).unwrap();
+        let (first_result, retry_result) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(first, successful_retry)
+        })
+        .await
+        .unwrap();
+        first_result.unwrap();
+        retry_result.unwrap();
+        assert_eq!(std::fs::read(&first_part).unwrap(), b"prefix");
+        assert_eq!(std::fs::read(&queued_part).unwrap(), b"ok");
+        server.await.unwrap();
+        drop(hub);
+        worker.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_body_and_keeps_the_prefix() {
+        let dir = test_directory();
+        let part = dir.join("update.part");
+        let prefix = b"downloaded prefix";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/installer", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(prefix).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut req = DownloadRequest::new("stall", "update", vec![url], part.clone());
+        req.timeout = Some(Duration::from_secs(60));
+        let stop = async {
+            while tokio::fs::metadata(&part)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0)
+                < prefix.len() as u64
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(run_transfer(None, req, Arc::clone(&cancel)), stop)
+        })
+        .await;
+        server.abort();
+        let (result, ()) = outcome.expect("cancellation must wake a stalled response body");
+        assert_eq!(result.unwrap_err(), "download cancelled");
+        assert_eq!(tokio::fs::read(&part).await.unwrap(), prefix);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mismatch_clears_untrusted_bytes_even_when_windows_denies_deletion() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = test_directory();
+        let part = dir.join("update.part");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            // Permit reads/writes but omit FILE_SHARE_DELETE, as a scanner can.
+            .share_mode(0x1 | 0x2)
+            .open(&part)
+            .unwrap();
+        let good = b"official installer bytes";
+        let bad = b"untrusted executable prefix";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in [bad.as_slice(), good.as_slice()] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut req = DownloadRequest::new(
+            "digest",
+            "update",
+            vec![format!("{base}/bad"), format!("{base}/good")],
+            part.clone(),
+        );
+        req.expected_sha256 = Some(hex::encode(Sha256::digest(good)));
+        req.timeout = Some(Duration::from_secs(3));
+        let done = run_transfer(None, req, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(done.bytes, good.len() as u64);
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            good,
+            "verified bytes must be the entire on-disk installer"
+        );
+        server.await.unwrap();
+        drop(locked);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn content_range_parses_shapes() {

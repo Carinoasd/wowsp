@@ -28,6 +28,11 @@
 //! `WoWSP_<version>_x64-installer-lite.exe` (see `artifact_url`: an app
 //! update never re-ships the resource pack, which updates through its own
 //! channel) under each mirror base.
+//! Before any byte is accepted, the installer's sha256 is read from the
+//! official release API (`api.github.com`, never a mirror — the `digest`
+//! GitHub computes for every release asset) and the hub verifies the
+//! stream against it; no reachable digest or a mismatch on every mirror
+//! means no installer is spawned.
 //! The hardened installer kills the running app and installs over its
 //! directory, so the frontend treats the command's promise never resolving
 //! (app death) or resolving (installer spawned) as success by design; the
@@ -43,7 +48,7 @@
 
 use futures::StreamExt;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use wowsp_tauri_shared::download::{kind, phase};
@@ -60,10 +65,103 @@ const SHUN_UPDATE_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/shun-upda
 /// `CARGO_PKG_VERSION` (the workspace version).
 const APP_VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/app-version.txt"));
 
-/// Set while an update download is in flight: double triggers (auto banner +
-/// manual button) collapse into the first pass instead of racing the same
-/// temp artifact.
-static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// One pass owns both the installer path and cancellation from resolution
+/// through handoff. A cancel between passes cannot affect the next pass.
+static UPDATE_PASS: Mutex<Option<Arc<UpdatePass>>> = Mutex::new(None);
+
+#[derive(Default, PartialEq)]
+enum UpdateStage {
+    #[default]
+    Downloading,
+    Cancelled,
+    Installing,
+}
+
+#[derive(Default)]
+struct UpdatePass {
+    stage: Mutex<UpdateStage>,
+    changed: tokio::sync::Notify,
+}
+
+impl UpdatePass {
+    fn cancel(&self) -> bool {
+        let mut stage = self.stage.lock().unwrap_or_else(|e| e.into_inner());
+        if *stage == UpdateStage::Installing {
+            return false;
+        }
+        *stage = UpdateStage::Cancelled;
+        self.changed.notify_one();
+        true
+    }
+
+    fn check_cancelled(&self) -> Result<(), String> {
+        if *self.stage.lock().unwrap_or_else(|e| e.into_inner()) == UpdateStage::Cancelled {
+            Err(CANCEL_MSG.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.check_cancelled().is_err() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Only wrap cancellable reads here. In particular, dropping the hub's
+    /// waiter would leave its writer alive and let a retry reuse its path.
+    async fn run<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => Err(CANCEL_MSG.to_string()),
+            result = operation => {
+                self.check_cancelled()?;
+                result
+            },
+        }
+    }
+
+    /// The last cancellable point. Serialize this transition with cancel:
+    /// once handoff starts, a late click must not claim installation stopped.
+    fn begin_install(&self) -> Result<(), String> {
+        let mut stage = self.stage.lock().unwrap_or_else(|e| e.into_inner());
+        if *stage == UpdateStage::Cancelled {
+            return Err(CANCEL_MSG.to_string());
+        }
+        *stage = UpdateStage::Installing;
+        Ok(())
+    }
+}
+
+struct UpdateGuard<'a> {
+    registry: &'a Mutex<Option<Arc<UpdatePass>>>,
+    pass: Arc<UpdatePass>,
+}
+
+impl<'a> UpdateGuard<'a> {
+    fn begin(registry: &'a Mutex<Option<Arc<UpdatePass>>>) -> Option<Self> {
+        let mut active = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if active.is_some() {
+            return None;
+        }
+        let pass = Arc::new(UpdatePass::default());
+        *active = Some(Arc::clone(&pass));
+        Some(Self { registry, pass })
+    }
+}
+
+impl Drop for UpdateGuard<'_> {
+    fn drop(&mut self) {
+        *self.registry.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 /// An installer is hundreds of MB; anything smaller is a mirror error page.
 const MIN_INSTALLER_BYTES: u64 = 1_000_000;
@@ -91,7 +189,81 @@ const JOB_ID: &str = "update";
 /// installer is only worth downloading on a fresh install.
 fn artifact_url(base: &str, version: &str) -> String {
     let base = base.trim().trim_end_matches('/');
-    format!("{base}/WoWSP_{version}_x64-installer-lite.exe")
+    format!("{base}/{}", artifact_name(version))
+}
+
+/// The bare installer asset name for a release (see [`artifact_url`]).
+fn artifact_name(version: &str) -> String {
+    format!("WoWSP_{version}_x64-installer-lite.exe")
+}
+
+// ── Artifact integrity (official digest) ─────────────────────────────────
+
+/// The official release API for one tag. Deliberately NOT routed through
+/// `github_mirror`: the digest is the trust anchor for installer bytes that
+/// may stream from third-party mirrors, so it must come from GitHub itself
+/// — a mirror able to serve both the artifact and its hash could forge both.
+fn release_api_url(version: &str) -> String {
+    format!("https://api.github.com/repos/langyo/wowsp/releases/tags/v{version}")
+}
+
+/// Per-attempt cap on the digest lookup (the payload is a few KB).
+const DIGEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Attempts at the digest lookup before the update is refused.
+const DIGEST_ATTEMPTS: usize = 3;
+
+/// The lowercase sha256 GitHub computed for asset `name` in a release-API
+/// payload (`"digest": "sha256:<hex>"`). `None` when the asset is missing,
+/// carries no digest, or the digest is not a well-formed sha256.
+fn asset_sha256(release: &serde_json::Value, name: &str) -> Option<String> {
+    let hex = release["assets"]
+        .as_array()?
+        .iter()
+        .find(|asset| asset["name"].as_str() == Some(name))?["digest"]
+        .as_str()?
+        .strip_prefix("sha256:")?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// Fetch the official sha256 of the installer for `version`. Any failure
+/// is an `Err`: an installer that cannot be verified is never spawned.
+async fn fetch_official_sha256(client: &reqwest::Client, version: &str) -> Result<String, String> {
+    let url = release_api_url(version);
+    let name = artifact_name(version);
+    let mut last_err = String::new();
+    for _ in 0..DIGEST_ATTEMPTS {
+        let response = client
+            .get(&url)
+            .header("User-Agent", "WoWSP-updater")
+            .header("Accept", "application/vnd.github+json")
+            .timeout(DIGEST_TIMEOUT)
+            .send()
+            .await;
+        let release: serde_json::Value = match response {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = format!("parse {url}: {e}");
+                    continue;
+                },
+            },
+            Ok(r) => {
+                last_err = format!("{url}: HTTP {}", r.status());
+                continue;
+            },
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                continue;
+            },
+        };
+        return asset_sha256(&release, &name)
+            .ok_or_else(|| format!("release v{version} publishes no sha256 digest for {name}"));
+    }
+    Err(format!(
+        "cannot verify the update (official digest unavailable: {last_err}); download it manually from GitHub Releases"
+    ))
 }
 
 /// The parsed update-watch config (mirrors `shun::config::UpdateWatchConfig`;
@@ -365,15 +537,16 @@ async fn cleanup_part_files(keep: Option<&std::path::Path>) {
 #[tauri::command]
 pub async fn update_download(app: AppHandle) -> Result<(), String> {
     // Collapse double triggers (banner + About button) into one pass.
-    if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+    let Some(guard) = UpdateGuard::begin(&UPDATE_PASS) else {
         return Ok(());
-    }
-    let result = update_download_inner(&app).await;
-    UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    };
+    let result = update_download_inner(&app, &guard.pass).await;
+    // Cancellation wins over an API/rename error racing with the click.
+    guard.pass.check_cancelled()?;
     result
 }
 
-async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
+async fn update_download_inner(app: &AppHandle, pass: &UpdatePass) -> Result<(), String> {
     // Drop a stale cancel pressed while no pass was registered (e.g.
     // during the previous pass's installer spawn tail) - THIS attempt is
     // user-initiated and must not inherit it.
@@ -391,7 +564,9 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "no marker file declared in the update sources".to_string())?;
     let client = build_http_client()?;
     emit_phase(app, phase::RACE);
-    let candidates = race_sources(&client, &watch.sources, marker, true).await?;
+    let candidates = pass
+        .run(race_sources(&client, &watch.sources, marker, true))
+        .await?;
     // Stale-mirror guard: a mirror still serving an older release would
     // fetch a different artifact file — only sources agreeing with the
     // winner stay in the race.
@@ -401,6 +576,9 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
         .filter(|c| c.version == version)
         .map(|c| artifact_url(&c.base, &version))
         .collect();
+    // The official digest is fetched straight from api.github.com before a
+    // single mirror byte is accepted; without it the update is refused.
+    let expected_sha256 = pass.run(fetch_official_sha256(&client, &version)).await?;
     tracing::info!(%version, racers = sources.len(), "update download starting");
 
     // Version-scoped, pid-suffixed temp name: the part survives failed
@@ -415,24 +593,30 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
     // launch; a running instance's part is held open and simply fails
     // the best-effort delete on Windows.
     cleanup_part_files(Some(&part_path)).await;
+    pass.check_cancelled()?;
 
     // ── Phase 2: queued transfer through the unified download hub ─────
-    let done = download_hub::transfer(
+    let transferred = download_hub::transfer(
         Some(app),
         DownloadRequest {
             min_bytes: MIN_INSTALLER_BYTES,
             race_window: Some(RACE_WINDOW),
             resume: true,
             cancel_msg: CANCEL_MSG.to_string(),
-            // No sha exists for the installer artifact (mirrors publish
-            // none), but the transfer stays bounded anyway: an unbounded
-            // stream would head-of-line-block every later hub job
-            // (pack / mods / data pack) behind a dead connection.
+            // Verified streaming against GitHub's own digest: a mirror
+            // serving tampered or truncated bytes fails the check and the
+            // hub moves on to the next candidate.
+            expected_sha256: Some(expected_sha256),
+            // The transfer stays bounded: an unbounded stream would
+            // head-of-line-block every later hub job (pack / mods / data
+            // pack) behind a dead connection.
             timeout: Some(Duration::from_secs(7200)),
             ..DownloadRequest::new(JOB_ID, kind::UPDATE, sources, part_path)
         },
     )
-    .await?;
+    .await;
+    pass.check_cancelled()?;
+    let done = transferred?;
     tracing::info!(%version, bytes = done.bytes, "installer artifact ready");
 
     // ── Assemble ────────────────────────────────────────────────────────
@@ -443,7 +627,11 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
         if renamed.is_ok() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        pass.run(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        })
+        .await?;
         renamed = tokio::fs::rename(&done.path, &installer_path).await;
     }
     renamed.map_err(|e| format!("assemble {}: {e}", installer_path.display()))?;
@@ -461,6 +649,7 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
         .to_path_buf();
     // Tell the webui the install phase started even though the spawned
     // installer may kill this app before the command's promise settles.
+    pass.begin_install()?;
     emit_phase(app, phase::INSTALL);
     std::process::Command::new(&installer_path)
         .args(["--silent", &format!("--dir={}", install_dir.display())])
@@ -474,15 +663,19 @@ async fn update_download_inner(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// The banner's 取消 button: flag the in-flight hub job so the streaming
-/// loop tears it down on the next chunk boundary (the part file is KEPT —
-/// it is the resume base of the next attempt), `Err("update cancelled")`
-/// is returned — the frontend maps that to a clean reset with the update
-/// still available. A no-op between passes.
+/// The banner's 取消 button: interrupt resolution/digest reads and cancel
+/// the hub job, retaining downloaded bytes for a later retry. The pass
+/// returns `Err("update cancelled")`, which the frontend treats as a clean
+/// reset. A no-op between passes or after installer handoff begins.
 #[tauri::command]
 pub fn update_cancel() -> Result<(), String> {
-    tracing::info!("update download cancelled by user");
-    download_hub::cancel(kind::UPDATE, JOB_ID);
+    // Keep the registration locked until the hub sees the cancel, so the
+    // previous pass cannot leave a pending cancel in a newly started pass.
+    let active = UPDATE_PASS.lock().unwrap_or_else(|e| e.into_inner());
+    if active.as_ref().is_some_and(|pass| pass.cancel()) {
+        tracing::info!("update download cancelled by user");
+        download_hub::cancel(kind::UPDATE, JOB_ID);
+    }
     Ok(())
 }
 
@@ -491,6 +684,109 @@ pub fn update_cancel() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_lookup() {
+        use tokio::io::AsyncReadExt;
+
+        let pass = UpdatePass::default();
+        // A local HTTPS proxy accepts CONNECT but never establishes the
+        // tunnel. Exercise the real official-digest request without any
+        // external traffic or a test-only alternate trust anchor.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(proxy).unwrap())
+            .build()
+            .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"CONNECT api.github.com:443 "));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        let cancel = async {
+            ready.await.unwrap();
+            assert!(pass.cancel());
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(pass.run(fetch_official_sha256(&client, "0.5.4")), cancel)
+        })
+        .await;
+        server.abort();
+        let (result, ()) =
+            outcome.expect("cancel must not wait for the lookup's 20-second timeout");
+        assert_eq!(result, Err(CANCEL_MSG.to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_a_lookup_error_in_the_same_poll() {
+        let pass = UpdatePass::default();
+        let result: Result<(), String> = pass
+            .run(async {
+                assert!(pass.cancel());
+                Err("official digest unavailable".to_string())
+            })
+            .await;
+        assert_eq!(result, Err(CANCEL_MSG.to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_lookup_never_polls_the_request() {
+        let pass = UpdatePass::default();
+        assert!(pass.cancel());
+        let result: Result<(), String> = pass
+            .run(async { panic!("a cancelled pass must not start another request") })
+            .await;
+        assert_eq!(result, Err(CANCEL_MSG.to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_lookup_preserves_integrity_errors() {
+        let pass = UpdatePass::default();
+        let result: Result<(), String> = pass
+            .run(async { Err("release publishes no sha256 digest".to_string()) })
+            .await;
+        assert_eq!(
+            result,
+            Err("release publishes no sha256 digest".to_string())
+        );
+    }
+
+    #[test]
+    fn cancelled_pass_cannot_hand_off_to_the_installer() {
+        let pass = UpdatePass::default();
+        assert!(pass.cancel());
+        assert_eq!(pass.begin_install(), Err(CANCEL_MSG.to_string()));
+    }
+
+    #[test]
+    fn handoff_is_the_last_cancellable_point() {
+        let pass = UpdatePass::default();
+        pass.begin_install().unwrap();
+        assert!(!pass.cancel());
+        assert_eq!(pass.check_cancelled(), Ok(()));
+    }
+
+    #[test]
+    fn retry_gets_a_new_pass_and_an_old_cancel_cannot_reach_it() {
+        let registry = Mutex::new(None);
+        let first = UpdateGuard::begin(&registry).unwrap();
+        assert!(UpdateGuard::begin(&registry).is_none());
+        let previous = Arc::clone(&first.pass);
+        previous.cancel();
+        drop(first);
+        let retry = UpdateGuard::begin(&registry).unwrap();
+        previous.cancel();
+        assert_eq!(retry.pass.check_cancelled(), Ok(()));
+    }
 
     #[test]
     fn newer_patch_is_detected() {
@@ -636,6 +932,81 @@ mod tests {
             version_from_redirect("https://example.test/tag/"),
             None,
             "empty tag name"
+        );
+    }
+
+    #[test]
+    fn release_api_url_targets_github_directly() {
+        // The digest source must never be a mirror prefix.
+        assert_eq!(
+            release_api_url("0.5.4"),
+            "https://api.github.com/repos/langyo/wowsp/releases/tags/v0.5.4"
+        );
+    }
+
+    #[test]
+    fn asset_sha256_picks_the_lite_installer_digest() {
+        let hex = "5c25dea369c26b8889c1a0dcd8697d0de6f138c12a68721e47479cd9c675116d";
+        let release = serde_json::json!({
+            "assets": [
+                { "name": "latest", "digest": "sha256:8878893c4e9b58612d5d96a468552e495493152ae49a02196c9af550c556e71d" },
+                { "name": "WoWSP_0.5.4_x64-installer-lite.exe", "digest": format!("sha256:{}", hex.to_uppercase()) },
+                { "name": "WoWSP_0.5.4_x64-installer.exe", "digest": "sha256:05ba4ab13167014d9ed80f99e4ba5d191b20c859b98689425433075dbe779577" },
+            ]
+        });
+        assert_eq!(
+            asset_sha256(&release, &artifact_name("0.5.4")),
+            Some(hex.to_string()),
+            "matched by exact name and normalized to lowercase"
+        );
+    }
+
+    #[test]
+    fn asset_sha256_rejects_missing_or_malformed_digests() {
+        let name = artifact_name("0.5.4");
+        let with_digest = |digest: serde_json::Value| serde_json::json!({ "assets": [{ "name": name, "digest": digest }] });
+        assert_eq!(
+            asset_sha256(&serde_json::json!({}), &name),
+            None,
+            "no assets"
+        );
+        assert_eq!(
+            asset_sha256(&serde_json::json!({ "assets": [{ "name": name }] }), &name),
+            None,
+            "asset without a digest"
+        );
+        assert_eq!(
+            asset_sha256(&with_digest(serde_json::Value::Null), &name),
+            None
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest("md5:d41d8cd98f00b204e9800998ecf8427e".into()),
+                &name
+            ),
+            None,
+            "non-sha256 algorithm"
+        );
+        assert_eq!(
+            asset_sha256(&with_digest("sha256:abc".into()), &name),
+            None,
+            "short"
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest(format!("sha256:{}", "z".repeat(64)).into()),
+                &name
+            ),
+            None,
+            "non-hex"
+        );
+        assert_eq!(
+            asset_sha256(
+                &with_digest(format!("sha256:{}", "a".repeat(64)).into()),
+                "other.exe"
+            ),
+            None,
+            "other asset name"
         );
     }
 }
