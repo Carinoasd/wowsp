@@ -21,7 +21,7 @@ pub(crate) fn appdata_dir_path() -> Result<PathBuf, String> {
 
 /// IPC names are relative data-file names, never arbitrary filesystem paths.
 /// Reject Windows aliases on every platform and links below the chosen root.
-fn data_file_path(dir: &Path, file: &str) -> Result<PathBuf, String> {
+pub(crate) fn data_file_path(dir: &Path, file: &str) -> Result<PathBuf, String> {
     let mut path = dir.to_path_buf();
     for segment in file.split('/') {
         let stem = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
@@ -72,7 +72,7 @@ pub(crate) fn read_appdata_json(file: &str) -> Result<Option<String>, String> {
     read_json_in(&appdata_dir_path()?, file)
 }
 
-fn read_json_in(dir: &Path, file: &str) -> Result<Option<String>, String> {
+pub(crate) fn read_json_in(dir: &Path, file: &str) -> Result<Option<String>, String> {
     let path = data_file_path(dir, file)?;
     match fs::read_to_string(&path) {
         Ok(content) => Ok(Some(content)),

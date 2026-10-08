@@ -121,55 +121,66 @@ fn now_unix() -> i64 {
 }
 
 /// Run `f` against the tracker state, recovering from a poisoned lock (a
-/// panic in one tick must not lose the whole ledger).
-fn with_state<R>(f: impl FnOnce(&mut PlaytimeState) -> R) -> R {
+/// panic in one tick must not lose the whole ledger). An unreadable ledger
+/// leaves the state uninitialized, so later observations retry loading it
+/// instead of eventually persisting an empty replacement over its history.
+fn with_state<R>(f: impl FnOnce(&mut PlaytimeState) -> R) -> Option<R> {
     let mut guard = STATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = guard.get_or_insert_with(|| PlaytimeState {
-        store: load_store(),
-        last_persist: 0,
-        dirty: false,
-        misses: 0,
-    });
-    f(state)
+    match loaded_state(&mut guard, load_store) {
+        Ok(state) => Some(f(state)),
+        Err(error) => {
+            tracing::warn!(%error, "playtime ledger unavailable; preserving it and retrying later");
+            None
+        },
+    }
+}
+
+fn loaded_state(
+    slot: &mut Option<PlaytimeState>,
+    load: impl FnOnce() -> Result<PlaytimeStore, String>,
+) -> Result<&mut PlaytimeState, String> {
+    if slot.is_none() {
+        let store = load()?;
+        *slot = Some(PlaytimeState {
+            store,
+            last_persist: 0,
+            dirty: false,
+            misses: 0,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("successful load initialized the state"))
 }
 
 /// Read the ledger, creating (and seeding) it on first run. The fresh file
 /// is written back immediately so the once-only import cannot repeat after
 /// a crash.
-fn load_store() -> PlaytimeStore {
-    match super::appdata::read_appdata_json(PLAYTIME_FILE) {
-        Ok(Some(raw)) => match serde_json::from_str::<PlaytimeStore>(&raw) {
-            Ok(store) => store,
-            Err(e) => {
-                tracing::warn!(error = %e, "playtime.json unreadable — starting a fresh ledger");
-                fresh_store()
-            },
-        },
-        Ok(None) => fresh_store(),
-        Err(e) => {
-            tracing::warn!(error = %e, "playtime.json unreadable — starting a fresh ledger");
-            fresh_store()
-        },
-    }
+fn load_store() -> Result<PlaytimeStore, String> {
+    load_store_in(&super::appdata::appdata_dir_path()?)
 }
 
-/// A brand-new ledger: plain defaults, persisted immediately. (The first-run
-/// Steam seed is gone with the historical-scan removal — see the module
-/// docs; only the persist-once shape survives so a crash cannot re-run any
-/// first-run logic.)
-fn fresh_store() -> PlaytimeStore {
-    let store = PlaytimeStore::default();
-    if let Err(e) = persist_store(&store) {
-        tracing::warn!(error = %e, "could not write the fresh playtime ledger");
+fn load_store_in(dir: &Path) -> Result<PlaytimeStore, String> {
+    match super::appdata::read_json_in(dir, PLAYTIME_FILE)? {
+        Some(raw) => serde_json::from_str::<PlaytimeStore>(&raw)
+            .map_err(|e| format!("parse playtime ledger: {e}")),
+        None => {
+            let store = PlaytimeStore::default();
+            persist_store_in(dir, &store)?;
+            Ok(store)
+        },
     }
-    store
 }
 
 fn persist_store(store: &PlaytimeStore) -> Result<(), String> {
+    persist_store_in(&super::appdata::appdata_dir_path()?, store)
+}
+
+fn persist_store_in(dir: &Path, store: &PlaytimeStore) -> Result<(), String> {
     let json = serde_json::to_string(store).map_err(|e| format!("serialize playtime: {e}"))?;
-    super::appdata::write_appdata_json(PLAYTIME_FILE, &json)
+    super::appdata::write_json_in(dir, PLAYTIME_FILE, &json)
 }
 
 // ── observation (fed by the session poller) ────────────────────────────────
@@ -184,7 +195,7 @@ const GAP_SPLIT_SECS: i64 = 120;
 /// a state transition happened or the minute-long heartbeat came due.
 pub(super) fn observe(info: &wowsp_tauri_shared::GameProcessInfo) {
     let now = now_unix();
-    with_state(|state| {
+    let _ = with_state(|state| {
         // Windows resolves the true creation time; other targets count from
         // the first observation.
         let proc_start = if info.running {
@@ -334,7 +345,7 @@ fn persist(state: &mut PlaytimeState, now: i64) {
 /// recorded heartbeat.
 pub(crate) fn flush() {
     let now = now_unix();
-    with_state(|state| {
+    let _ = with_state(|state| {
         if state.dirty {
             persist(state, now);
         }
@@ -526,6 +537,7 @@ fn day_key_of<Tz: TimeZone>(ts: i64, tz: &Tz) -> String {
 fn current_overview() -> PlaytimeOverview {
     let now = now_unix();
     with_state(|state| overview_of(&state.store, now, &Local))
+        .unwrap_or_else(|| overview_of(&PlaytimeStore::default(), now, &Local))
 }
 
 /// The playtime page's full payload. Cross-platform: on mobile (no session
@@ -807,6 +819,105 @@ mod tests {
     use super::*;
     use chrono::FixedOffset;
     use wowsp_tauri_shared::GameInstallKind;
+
+    struct StoreFixture(std::path::PathBuf);
+
+    impl StoreFixture {
+        fn new() -> Self {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("wowsp-playtime-store-{}", hex::encode(nonce)));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for StoreFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn malformed_existing_playtime_is_not_replaced_with_an_empty_ledger() {
+        let fixture = StoreFixture::new();
+        for bytes in [b"{\"sessions\":".as_slice(), &[0xff]] {
+            std::fs::write(fixture.0.join(PLAYTIME_FILE), bytes).unwrap();
+            assert!(load_store_in(&fixture.0).is_err());
+            assert_eq!(std::fs::read(fixture.0.join(PLAYTIME_FILE)).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn temporarily_unreadable_playtime_can_retry_without_losing_history() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = StoreFixture::new();
+        let original = PlaytimeStore {
+            sessions: vec![PlaytimeSession {
+                start: 100,
+                end: 700,
+            }],
+            launches: 3,
+            ..PlaytimeStore::default()
+        };
+        persist_store_in(&fixture.0, &original).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(fixture.0.join(PLAYTIME_FILE))
+            .unwrap();
+        let mut slot = None;
+        let first = loaded_state(&mut slot, || load_store_in(&fixture.0));
+        assert!(
+            first.is_err(),
+            "a locked ledger must not initialize empty tracking state"
+        );
+        assert!(slot.is_none());
+        drop(lock);
+        let recovered = loaded_state(&mut slot, || load_store_in(&fixture.0)).unwrap();
+        assert_eq!(recovered.store.sessions, original.sessions);
+        assert_eq!(recovered.store.launches, 3);
+        observe_transition(
+            &mut recovered.store,
+            true,
+            Some(1000),
+            1100,
+            &mut recovered.misses,
+        );
+        persist_store_in(&fixture.0, &recovered.store).unwrap();
+        let saved = load_store_in(&fixture.0).unwrap();
+        assert_eq!(saved.sessions, original.sessions);
+        assert_eq!(
+            saved.open,
+            Some(PlaytimeSession {
+                start: 1000,
+                end: 1100
+            })
+        );
+        assert_eq!(saved.launches, 4);
+    }
+
+    #[test]
+    fn only_an_absent_playtime_ledger_initializes_and_persists_defaults() {
+        let fixture = StoreFixture::new();
+        let mut slot = None;
+        let loaded = loaded_state(&mut slot, || load_store_in(&fixture.0)).unwrap();
+        assert!(loaded.store.sessions.is_empty());
+        assert_eq!(loaded.store.launches, 0);
+        assert!(fixture.0.join(PLAYTIME_FILE).is_file());
+        assert!(load_store_in(&fixture.0).unwrap().sessions.is_empty());
+        // An initialized slot must not reload over observations already made.
+        loaded.store.launches = 1;
+        assert_eq!(
+            loaded_state(&mut slot, || panic!("already loaded"))
+                .unwrap()
+                .store
+                .launches,
+            1
+        );
+    }
 
     /// +08:00 — a fixed offset so the day-split geometry is pinned no
     /// matter which timezone the test machine runs in.
