@@ -608,35 +608,42 @@ impl Default for BattleCache {
     }
 }
 
-/// Load the cache; an unreadable or corrupt file answers empty (a broken
-/// cache only costs a re-parse, never a failed command). A version mismatch
-/// discards just as cheaply — the entries re-parse on the next scan.
-fn load_battle_cache() -> BattleCache {
-    match super::appdata::read_appdata_json(BATTLES_CACHE_FILE) {
-        Ok(Some(raw)) => match serde_json::from_str::<BattleCache>(&raw) {
-            Ok(cache) if cache.version == BATTLES_CACHE_VERSION => cache,
-            Ok(_) => {
-                tracing::info!("playtime battle cache version stale — rescanning");
-                BattleCache::default()
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "playtime battle cache unreadable — rescanning");
-                BattleCache::default()
-            },
-        },
-        _ => BattleCache::default(),
+/// The v4 cache is permanent history, so read/parse failures must leave it
+/// untouched for a later retry. Only missing files and known pre-history
+/// schemas start empty; legacy payloads re-parse from their live replays.
+fn load_battle_cache_in(dir: &Path) -> Result<BattleCache, String> {
+    let Some(raw) = super::appdata::read_json_in(dir, BATTLES_CACHE_FILE)? else {
+        return Ok(BattleCache::default());
+    };
+    let document: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse battle history: {e}"))?;
+    // Read the version before today's entry shape: v3 stored ReplayMetaLite,
+    // and a future schema may also have entirely different rows.
+    let version = document
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("battle history has no valid schema version")?;
+    if (1..u64::from(BATTLES_CACHE_VERSION)).contains(&version) {
+        tracing::info!(version, "playtime battle cache version stale — rescanning");
+        return Ok(BattleCache::default());
     }
+    if version != u64::from(BATTLES_CACHE_VERSION) {
+        return Err(format!("unsupported battle history schema {version}"));
+    }
+    if !document
+        .get("entries")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err("battle history has no valid entries map".into());
+    }
+    serde_json::from_value(document).map_err(|e| format!("parse battle history: {e}"))
 }
 
 /// Persist the cache atomically (tmp + rename via the shared appdata
-/// helper). Two concurrent `playtime_battles` invokes racing this write are
-/// BENIGN by design: both scans see the same disk state, so the last
-/// writer's file is at worst missing the other's just-upserted entries
-/// (re-parsed next run) — never a torn or interleaved file. No mutex
-/// needed.
-fn save_battle_cache(cache: &BattleCache) -> Result<(), String> {
+/// helper). The scan gate keeps each writer's input history current.
+fn save_battle_cache_in(dir: &Path, cache: &BattleCache) -> Result<(), String> {
     let json = serde_json::to_string(cache).map_err(|e| format!("serialize battle cache: {e}"))?;
-    super::appdata::write_appdata_json(BATTLES_CACHE_FILE, &json)
+    super::appdata::write_json_in(dir, BATTLES_CACHE_FILE, &json)
 }
 
 /// Stamp a battle row with the root's owning install — the exact
@@ -789,27 +796,40 @@ fn battles_from_roots(
 #[tauri::command]
 pub async fn playtime_battles() -> Result<PlaytimeBattles, String> {
     tokio::task::spawn_blocking(|| {
-        let mut cache = load_battle_cache();
-        let roots = super::game_context::replay_roots();
-        // "Changed" = the cache serialization differs after the run — a
-        // fresh parse upserted (a new or edited replay). An unchanged tree
-        // writes nothing back; history entries never churn.
-        let before =
-            serde_json::to_string(&cache).map_err(|e| format!("serialize battle cache: {e}"))?;
-        let battles = battles_from_roots(&roots, &mut cache);
-        let after =
-            serde_json::to_string(&cache).map_err(|e| format!("serialize battle cache: {e}"))?;
-        if before != after {
-            // A failed cache write must not fail the ledger — the rows are
-            // already correct; only the next scan re-parses.
-            if let Err(e) = save_battle_cache(&cache) {
-                tracing::warn!(error = %e, "playtime battle cache persist failed");
-            }
-        }
-        Ok(PlaytimeBattles { battles })
+        scan_battle_cache_in(&super::appdata::appdata_dir_path()?, |cache| {
+            let roots = super::game_context::replay_roots();
+            battles_from_roots(&roots, cache)
+        })
     })
     .await
     .map_err(|e| format!("playtime battles task failed: {e}"))?
+}
+
+/// Different scans can observe different roots/files. Keep the complete
+/// load-scan-save together so an older scan cannot erase another's history.
+/// The command already runs this blocking work on the blocking thread pool.
+static BATTLE_SCAN_GATE: Mutex<()> = Mutex::new(());
+
+fn scan_battle_cache_in(
+    dir: &Path,
+    scan: impl FnOnce(&mut BattleCache) -> Vec<PlaytimeBattle>,
+) -> Result<PlaytimeBattles, String> {
+    let _scan = BATTLE_SCAN_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cache = load_battle_cache_in(dir)?;
+    // "Changed" = the cache serialization differs after the run — a
+    // fresh parse upserted (a new or edited replay). An unchanged tree
+    // writes nothing back; history entries never churn.
+    let before =
+        serde_json::to_string(&cache).map_err(|e| format!("serialize battle cache: {e}"))?;
+    let battles = scan(&mut cache);
+    let after =
+        serde_json::to_string(&cache).map_err(|e| format!("serialize battle cache: {e}"))?;
+    if before != after {
+        // A replay may disappear before the next scan. Report failed
+        // persistence instead of claiming its history was recorded.
+        save_battle_cache_in(dir, &cache)?;
+    }
+    Ok(PlaytimeBattles { battles })
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -916,6 +936,192 @@ mod tests {
                 .store
                 .launches,
             1
+        );
+    }
+
+    fn scan_fixture_battles(dir: &Path, root: &Path) -> Result<PlaytimeBattles, String> {
+        scan_battle_cache_in(dir, |cache| {
+            battles_from_roots(&[(root.to_path_buf(), None)], cache)
+        })
+    }
+
+    #[test]
+    fn battle_cache_persistence_preserves_malformed_history() {
+        let fixture = StoreFixture::new();
+        let root = fixture.0.join("replays");
+        write_synthetic_replay(
+            &root.join("20261008_100000_new.wowsreplay"),
+            r#"{"matchGroup":"pvp"}"#,
+        );
+        let path = fixture.0.join(BATTLES_CACHE_FILE);
+        for original in [
+            b"{\"version\":4,\"entries\":{\"recoverable-history\":".as_slice(),
+            &[0xff],
+            br#"{"version":4,"entries":{"gone":{"len":1,"mtimeMs":1,"battle":null}}}"#,
+            br#"{"entries":{}}"#,
+            br#"{"version":4}"#,
+            br#"{"version":0,"entries":{}}"#,
+        ] {
+            std::fs::write(&path, original).unwrap();
+            let result = scan_fixture_battles(&fixture.0, &root);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(result.is_err(), "damaged permanent history must not reset");
+        }
+    }
+
+    #[test]
+    fn battle_cache_persistence_reparses_v3_rows_and_keeps_v4_history() {
+        let fixture = StoreFixture::new();
+        let root = fixture.0.join("replays");
+        let replay = root.join("20261008_100000_live.wowsreplay");
+        write_synthetic_replay(&replay, r#"{"matchGroup":"pvp"}"#);
+        let old = r#"{"version":3,"entries":{"old.wowsreplay":{"len":1,"mtimeMs":2,"lite":{"path":"old.wowsreplay","dateTime":"20261001_100000"}}}}"#;
+        std::fs::write(fixture.0.join(BATTLES_CACHE_FILE), old).unwrap();
+        let first = scan_fixture_battles(&fixture.0, &root).unwrap();
+        assert_eq!(first.battles.len(), 1);
+        let cache = load_battle_cache_in(&fixture.0).unwrap();
+        assert_eq!(cache.version, BATTLES_CACHE_VERSION);
+        assert_eq!(cache.entries.len(), 1);
+        std::fs::remove_file(replay).unwrap();
+        let historical = scan_fixture_battles(&fixture.0, &root).unwrap();
+        assert_eq!(historical.battles.len(), 1, "v4 history survives deletion");
+    }
+
+    #[test]
+    fn battle_cache_persistence_never_downgrades_future_history() {
+        let fixture = StoreFixture::new();
+        let root = fixture.0.join("replays");
+        write_synthetic_replay(
+            &root.join("20261008_100000_live.wowsreplay"),
+            r#"{"matchGroup":"pvp"}"#,
+        );
+        let original = r#"{"version":5,"entries":{"gone":{"newBattleFormat":"retained"}}}"#;
+        let path = fixture.0.join(BATTLES_CACHE_FILE);
+        std::fs::write(&path, original).unwrap();
+        let result = scan_fixture_battles(&fixture.0, &root);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn battle_cache_persistence_retries_read_errors_without_losing_vanished_replays() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = StoreFixture::new();
+        let root = fixture.0.join("replays");
+        let old_replay = root.join("20261001_100000_gone.wowsreplay");
+        write_synthetic_replay(&old_replay, r#"{"matchGroup":"pvp"}"#);
+        scan_fixture_battles(&fixture.0, &root).unwrap();
+        std::fs::remove_file(old_replay).unwrap();
+        let path = fixture.0.join(BATTLES_CACHE_FILE);
+        let original = std::fs::read(&path).unwrap();
+        write_synthetic_replay(
+            &root.join("20261008_100000_new.wowsreplay"),
+            r#"{"matchGroup":"ranked"}"#,
+        );
+        // Read denied, replacement allowed: the old implementation persisted
+        // just the live replay and irreversibly forgot the deleted one.
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0x2 | 0x4)
+            .open(&path)
+            .unwrap();
+        let result = scan_fixture_battles(&fixture.0, &root);
+        drop(lock);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(result.is_err());
+        let retry = scan_fixture_battles(&fixture.0, &root).unwrap();
+        assert_eq!(retry.battles.len(), 2, "retry must merge retained history");
+        assert_eq!(load_battle_cache_in(&fixture.0).unwrap().entries.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn battle_cache_persistence_reports_failed_publish_then_retries() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = StoreFixture::new();
+        let root = fixture.0.join("replays");
+        write_synthetic_replay(
+            &root.join("20261001_100000_old.wowsreplay"),
+            r#"{"matchGroup":"pvp"}"#,
+        );
+        scan_fixture_battles(&fixture.0, &root).unwrap();
+        let path = fixture.0.join(BATTLES_CACHE_FILE);
+        let original = std::fs::read(&path).unwrap();
+        write_synthetic_replay(
+            &root.join("20261008_100000_new.wowsreplay"),
+            r#"{"matchGroup":"ranked"}"#,
+        );
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1)
+            .open(&path)
+            .unwrap();
+        let result = scan_fixture_battles(&fixture.0, &root);
+        drop(lock);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(result.is_err(), "an unsaved scan must not report success");
+        assert_eq!(
+            scan_fixture_battles(&fixture.0, &root)
+                .unwrap()
+                .battles
+                .len(),
+            2
+        );
+        assert_eq!(load_battle_cache_in(&fixture.0).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn battle_cache_persistence_concurrent_scans_retain_both_histories() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let fixture = StoreFixture::new();
+        let first_root = fixture.0.join("first");
+        let second_root = fixture.0.join("second");
+        write_synthetic_replay(
+            &first_root.join("20261001_100000_first.wowsreplay"),
+            r#"{"matchGroup":"pvp"}"#,
+        );
+        write_synthetic_replay(
+            &second_root.join("20261008_100000_second.wowsreplay"),
+            r#"{"matchGroup":"ranked"}"#,
+        );
+        let (scanned, first_scanned) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let first_dir = fixture.0.clone();
+        let first = std::thread::spawn(move || {
+            scan_battle_cache_in(&first_dir, |cache| {
+                let rows = battles_from_roots(&[(first_root, None)], cache);
+                scanned.send(()).unwrap();
+                wait.recv().unwrap();
+                rows
+            })
+        });
+        first_scanned.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started, second_started) = mpsc::channel();
+        let (done, second_done) = mpsc::channel();
+        let second_dir = fixture.0.clone();
+        let second = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = scan_fixture_battles(&second_dir, &second_root);
+            done.send(()).unwrap();
+            result
+        });
+        second_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let overtook = second_done.recv_timeout(Duration::from_millis(250)).is_ok();
+        release.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let historical =
+            scan_battle_cache_in(&fixture.0, |cache| battles_from_roots(&[], cache)).unwrap();
+        assert_eq!(
+            historical.battles.len(),
+            2,
+            "neither completed scan may disappear"
+        );
+        assert!(
+            !overtook,
+            "each scan must start with the previous persisted history"
         );
     }
 
