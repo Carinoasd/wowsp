@@ -43,6 +43,7 @@ import {
   HkSelect,
   HkSlider,
   HkSpinner,
+  HkSwitch,
   HkTabs,
   HkTag,
   getThemeTokens,
@@ -88,6 +89,7 @@ import { useLanguage } from "@/i18n/useLanguage";
 import { api, type GameInstall, type NetworkConfig } from "@/api";
 import { formatEta, formatSpeed } from "@/utils/format";
 import { isMobileApp, isTauri } from "@/utils/platform";
+import { analyticsEnabled, setAnalyticsEnabled } from "@/utils/analytics";
 import { useRouter } from "vue-router";
 import { useConfigStore } from "@/stores/config";
 import { usePluginUpdatesStore } from "@/stores/pluginUpdates";
@@ -2273,6 +2275,19 @@ export default defineComponent({
             <HkSettingsHint>
               {pickTelemetryNotice(lang.uiLocale.value).text}
             </HkSettingsHint>
+            {/* The row styles compile under `.stats-prefs .stats-prefs__row`
+                (see StatsPrefsControls.scss), so the group wrapper is what
+                gives the label/desc column and the right-aligned switch
+                their layout — without it the row renders unstyled. */}
+            <div class="stats-prefs">
+              <div class="stats-prefs__row">
+                <span class="stats-prefs__row-text">
+                  <span class="stats-prefs__row-label">{t("settings.telemetryToggle")}</span>
+                  <span class="stats-prefs__row-desc">{t("settings.telemetryToggleDesc")}</span>
+                </span>
+                <HkSwitch modelValue={analyticsEnabled.value} onUpdate:modelValue={setAnalyticsEnabled} />
+              </div>
+            </div>
           </HkSettingsGroup>
           </>
           ),

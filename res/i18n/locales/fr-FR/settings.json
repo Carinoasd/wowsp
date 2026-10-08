@@ -138,6 +138,8 @@
   "overlayFullscreenNote": "※ Indisponible en plein écran exclusif : dans ce mode, la capture d'écran GDI ne renvoie que des images noires et la fenêtre de superposition ne peut pas s'afficher au-dessus d'une chaîne d'échange plein écran. Réglez le mode d'affichage du jeu sur sans bordure ou fenêtré.",
   "attributions": "Soutiens et crédits",
   "telemetryTitle": "Télémétrie d'utilisation",
+  "telemetryToggle": "Envoyer les statistiques d'utilisation",
+  "telemetryToggleDesc": "Pages consultées et langue de l'interface, anonymes, envoyées à Google Analytics. Désactiver arrête l'envoi immédiatement.",
   "account": "Compte",
   "accountHint": "Le compte actif alimente « Mes statistiques » et les recherches de données. Cliquez sur une carte pour changer ; utilisez « Ajouter un joueur » pour en lier un nouveau.",
   "statsSection": "Statistiques",

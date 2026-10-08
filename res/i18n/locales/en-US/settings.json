@@ -138,6 +138,8 @@
   "overlayFullscreenNote": "※ Unavailable in exclusive fullscreen: in that mode GDI screen capture only returns black frames, and the overlay window cannot sit on top of a fullscreen swap chain. Set the game's display mode to borderless or windowed.",
   "attributions": "Supporters & credits",
   "telemetryTitle": "Usage Telemetry",
+  "telemetryToggle": "Send usage telemetry",
+  "telemetryToggleDesc": "Anonymous page views and interface language sent to Google Analytics. Turning this off stops sending immediately.",
   "account": "Account",
   "accountHint": "The active account drives My Stats and record lookups. Click a card to switch; use Add player to bind a new one.",
   "statsSection": "Battle stats",

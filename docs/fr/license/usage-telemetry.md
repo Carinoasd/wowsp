@@ -23,3 +23,5 @@ La télémétrie est transmise à Google Analytics et conservée selon les condi
 ## Désactiver la télémétrie
 
 La version de bureau limite la télémétrie aux signaux d'utilisation décrits ci-dessus et aucune collecte n'a lieu avant la fin de l'assistant de premier démarrage. L'application étant entièrement open source, le code de la télémétrie peut être consulté à tout moment dans le dépôt.
+
+Pour désactiver la télémétrie, ouvrez **Paramètres → À propos → Télémétrie d'utilisation** et désactivez **Envoyer les statistiques d'utilisation**. L'envoi s'arrête immédiatement et ce choix est conservé aux lancements suivants.

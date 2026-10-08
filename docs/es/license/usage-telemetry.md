@@ -23,3 +23,5 @@ La telemetría se envía a Google Analytics y se conserva conforme a las condici
 ## Desactivar la telemetría
 
 La versión de escritorio limita la telemetría a las señales de uso descritas arriba y no se realiza ninguna recogida antes de que completes el asistente de primer inicio. Como la aplicación es totalmente de código abierto, las rutas de código de la telemetría pueden revisarse en el repositorio en cualquier momento.
+
+Para desactivar la telemetría, abre **Ajustes → Acerca de → Telemetría de uso** y desactiva **Enviar estadísticas de uso**. El envío se detiene de inmediato y la elección se conserva en los siguientes inicios.
