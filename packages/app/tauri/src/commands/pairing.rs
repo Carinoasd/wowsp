@@ -652,43 +652,146 @@ pub async fn pairing_pull_gamedata(
     }
 }
 
-/// Zip-slip-safe extraction of the game-data zip into the data dir
-/// (merge/overwrite). Entry names must be relative, stay inside the
-/// destination, and use forward slashes only per the zip spec: `enclosed_name`
-/// rejects `..` and absolute components, and the RAW name check rejects
-/// backslashes — necessary because on Windows `enclosed_name()` normalizes
-/// separators, so a hostile packer could otherwise smuggle `..\` components
-/// past a naive display-string check (and legit nested entries must NOT be
-/// rejected for the normalization either).
+/// The pairing protocol exports only these two cache trees. Validate the
+/// raw ZIP spelling before Path normalizes it, including Windows aliases
+/// (trailing dots/spaces and DOS device names), on every platform.
+fn gamedata_entry_path(name: &str, is_dir: bool) -> Option<PathBuf> {
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return None;
+    }
+    let name = if is_dir {
+        name.strip_suffix('/')?
+    } else {
+        name
+    };
+    let parts: Vec<&str> = name.split('/').collect();
+    if !matches!(parts.first().copied(), Some("gameparams" | "encyclopedia"))
+        || (!is_dir && parts.len() < 2)
+    {
+        return None;
+    }
+    for part in &parts {
+        if part.is_empty() || part.ends_with('.') || part.ends_with(' ') {
+            return None;
+        }
+        let base = part.split('.').next()?.to_ascii_uppercase();
+        if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ["COM", "LPT"].iter().any(|prefix| {
+                base.strip_prefix(prefix).is_some_and(|n| {
+                    matches!(
+                        n,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+            })
+        {
+            return None;
+        }
+    }
+    Some(PathBuf::from(name))
+}
+
+fn gamedata_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions and other reparse points need the same treatment as
+        // symlinks; is_symlink alone does not cover every reparse tag.
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Create only plain directories below the canonical extraction root.
+/// Existing links must never redirect a cache write into another tree.
+fn gamedata_parent(root: &Path, rel: &Path) -> Result<PathBuf, String> {
+    let mut dir = root.to_path_buf();
+    for part in rel.components() {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() && !gamedata_link(&meta) => {},
+            Ok(_) => return Err(format!("unsafe gamedata directory: {}", dir.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+            },
+            Err(e) => return Err(format!("inspect {}: {e}", dir.display())),
+        }
+    }
+    Ok(dir)
+}
+
+/// Merge only gameparams/** and encyclopedia/** from the paired host.
+/// Unrelated app data, Windows path aliases and filesystem links are never
+/// writable through this protocol. Each file is verified by the ZIP reader
+/// before replacing its old cache entry, preserving it on CRC/read failure.
 pub(crate) fn extract_gamedata_zip(archive: &Path, dest: &Path) -> Result<usize, String> {
     let file =
         std::fs::File::open(archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("read {}: {e}", archive.display()))?;
+    std::fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    let root = dest
+        .canonicalize()
+        .map_err(|e| format!("resolve {}: {e}", dest.display()))?;
     let mut extracted = 0usize;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-        if entry.name().contains('\\') || entry.name().contains(':') {
-            tracing::warn!(entry = entry.name(), "gamedata zip: skipping unsafe entry");
-            continue;
-        }
-        let Some(rel) = entry.enclosed_name() else {
+        let Some(rel) = gamedata_entry_path(entry.name(), entry.is_dir()) else {
             tracing::warn!(entry = entry.name(), "gamedata zip: skipping unsafe entry");
             continue;
         };
-        let out = dest.join(&rel);
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(format!(
+                "gamedata zip contains a symbolic link: {}",
+                entry.name()
+            ));
+        }
         if entry.is_dir() {
-            std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
+            gamedata_parent(&root, &rel)?;
             continue;
         }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        let parent = gamedata_parent(&root, rel.parent().unwrap_or(Path::new("")))?;
+        let out = root.join(&rel);
+        match std::fs::symlink_metadata(&out) {
+            Ok(meta) if !meta.is_file() || gamedata_link(&meta) => {
+                return Err(format!("unsafe gamedata file: {}", out.display()));
+            },
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("inspect {}: {e}", out.display()));
+            },
+            _ => {},
         }
-        let mut fout =
-            std::fs::File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-        std::io::copy(&mut entry, &mut fout)
-            .map_err(|e| format!("extract {}: {e}", out.display()))?;
+        // A fresh sibling plus rename also avoids truncating another file
+        // when an existing cache entry happens to be a hard link.
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|e| format!("gamedata temp entropy: {e}"))?;
+        let temp = parent.join(format!(".wowsp-gamedata-{}.part", hex::encode(nonce)));
+        let mut fout = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| format!("create {}: {e}", temp.display()))?;
+        let result = (|| -> Result<(), String> {
+            std::io::copy(&mut entry, &mut fout)
+                .map_err(|e| format!("extract {}: {e}", out.display()))?;
+            drop(fout);
+            std::fs::rename(&temp, &out).map_err(|e| format!("replace {}: {e}", out.display()))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result?;
         extracted += 1;
     }
     Ok(extracted)
@@ -2183,18 +2286,191 @@ pub(crate) mod tests {
         let file = std::fs::File::create(&evil).unwrap();
         let mut w = zip::ZipWriter::new(file);
         let opts = zip::write::SimpleFileOptions::default();
-        w.start_file("ok.txt", opts).unwrap();
+        w.start_file("gameparams/ok.txt", opts).unwrap();
         w.write_all(b"ok").unwrap();
         w.start_file("../evil.txt", opts).unwrap();
         w.write_all(b"evil").unwrap();
+        w.start_file("settings.json", opts).unwrap();
+        w.write_all(b"replacement settings").unwrap();
+        w.start_file("mods/installed.json", opts).unwrap();
+        w.write_all(b"replacement ledger").unwrap();
         w.finish().unwrap();
         let out_dir = tmp.join("out2");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("settings.json"), b"original settings").unwrap();
         let extracted = extract_gamedata_zip(&evil, &out_dir).unwrap();
         assert_eq!(extracted, 1);
-        assert!(out_dir.join("ok.txt").is_file());
+        assert!(out_dir.join("gameparams/ok.txt").is_file());
         assert!(!tmp.join("evil.txt").exists());
+        assert!(!out_dir.join("mods").exists());
+        assert_eq!(
+            std::fs::read(out_dir.join("settings.json")).unwrap(),
+            b"original settings"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gamedata_names_allow_only_cache_trees_without_platform_aliases() {
+        for name in ["gameparams/a.json", "encyclopedia/asia/船.json"] {
+            assert_eq!(gamedata_entry_path(name, false), Some(PathBuf::from(name)));
+        }
+        assert_eq!(
+            gamedata_entry_path("gameparams/", true),
+            Some(PathBuf::from("gameparams"))
+        );
+        for name in [
+            "settings.json",
+            "mods/installed.json",
+            "gameparams",
+            "gameparams.json/a",
+            "gameparams/../settings.json",
+            "gameparams/.. /settings.json",
+            "gameparams/./a.json",
+            "gameparams//a.json",
+            "gameparams/a/",
+            "gameparams/a\\b.json",
+            "gameparams/a:stream",
+            "gameparams/a.json.",
+            "gameparams/a.json ",
+            "gameparams/NUL.json",
+            "gameparams/com1/x",
+            "gameparams/LPT².json",
+            "gameparams/a\0.json",
+            "/gameparams/a.json",
+            "C:/gameparams/a.json",
+        ] {
+            assert_eq!(gamedata_entry_path(name, false), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn gamedata_rejects_archive_symlinks() {
+        let tmp = tempfile_dir();
+        let archive = tmp.join("cache.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .add_symlink(
+                "gameparams/link",
+                "../../outside",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let dest = tmp.join("dest");
+        let error = extract_gamedata_zip(&archive, &dest).unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(!dest.join("gameparams/link").exists());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gamedata_rejects_existing_directory_junction() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+
+        let tmp = tempfile_dir();
+        let dest = tmp.join("dest");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.json"), b"original").unwrap();
+        let link = dest.join("gameparams");
+        // Junction creation needs neither administrator privileges nor
+        // Developer Mode. Pass paths as data, never as PowerShell source.
+        let created = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:WOWSP_TEST_LINK -Target $env:WOWSP_TEST_TARGET -ErrorAction Stop | Out-Null",
+            ])
+            .env("WOWSP_TEST_LINK", &link)
+            .env("WOWSP_TEST_TARGET", &outside)
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let archive = tmp.join("cache.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file(
+                "gameparams/a.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"replacement").unwrap();
+        writer.finish().unwrap();
+        let result = extract_gamedata_zip(&archive, &dest);
+        let contents = std::fs::read(outside.join("a.json")).unwrap();
+        // Unlink the junction itself before recursively cleaning the fixture.
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
+        assert!(result.is_err(), "junction must not be followed: {result:?}");
+        assert_eq!(contents, b"original");
+    }
+
+    #[test]
+    fn gamedata_replacement_does_not_modify_hard_link_target() {
+        use std::io::Write;
+        let tmp = tempfile_dir();
+        let dest = tmp.join("dest");
+        std::fs::create_dir_all(dest.join("gameparams")).unwrap();
+        let original = tmp.join("original.json");
+        std::fs::write(&original, b"original").unwrap();
+        let target = dest.join("gameparams/a.json");
+        std::fs::hard_link(&original, &target).unwrap();
+        let archive = tmp.join("cache.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file(
+                "gameparams/a.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"updated").unwrap();
+        writer.finish().unwrap();
+        assert_eq!(extract_gamedata_zip(&archive, &dest).unwrap(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), b"updated");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn gamedata_corrupt_entry_preserves_existing_cache() {
+        use std::io::Write;
+        let tmp = tempfile_dir();
+        let dest = tmp.join("dest");
+        std::fs::create_dir_all(dest.join("gameparams")).unwrap();
+        let target = dest.join("gameparams/a.json");
+        std::fs::write(&target, b"original").unwrap();
+        let archive = tmp.join("cache.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("gameparams/a.json", options).unwrap();
+        writer.write_all(b"synthetic-cache-payload").unwrap();
+        writer.finish().unwrap();
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let offset = bytes
+            .windows(b"synthetic-cache-payload".len())
+            .position(|b| b == b"synthetic-cache-payload")
+            .unwrap();
+        bytes[offset] ^= 1; // Leave the original CRC in the central directory.
+        std::fs::write(&archive, bytes).unwrap();
+        assert!(extract_gamedata_zip(&archive, &dest).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read_dir(dest.join("gameparams")).unwrap().count(),
+            1
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[cfg(desktop)]
