@@ -108,7 +108,7 @@ pub fn set_game_config(active_path: Option<String>) -> Result<GameConfigResponse
     let active_path = sanitize_path(active_path);
     tracing::info!(?active_path, "active game install changed");
     let dir = paths::ensure_data_dir()?;
-    set_from(&dir, active_path.clone());
+    set_from(&dir, active_path.clone())?;
     Ok(GameConfigResponse { active_path })
 }
 
@@ -122,13 +122,12 @@ pub(crate) fn persisted_active_path(dir: &Path) -> Option<String> {
 
 /// Testable write core: sanitize → canonical TOML → atomic write → retire
 /// the legacy JSON twin (only after the write succeeded).
-fn set_from(dir: &Path, active_path: Option<String>) {
-    let Ok(canonical) = canonical_toml(active_path.as_deref()) else {
-        return;
-    };
-    if settings_store::store(dir, GAME_CONFIG_FILE, &canonical).is_ok() {
-        settings_store::retire_legacy_json(dir, LEGACY_GAME_CONFIG_FILE);
-    }
+fn set_from(dir: &Path, active_path: Option<String>) -> Result<(), String> {
+    let active_path = sanitize_path(active_path);
+    let canonical = canonical_toml(active_path.as_deref())?;
+    settings_store::store(dir, GAME_CONFIG_FILE, &canonical)?;
+    settings_store::retire_legacy_json(dir, LEGACY_GAME_CONFIG_FILE);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -167,7 +166,7 @@ mod tests {
         assert!(toml_text.contains("activePath"));
 
         // Clearing the path rewrites canonical (empty) and stays stable.
-        set_from(&dir, Some("".into()));
+        set_from(&dir, Some("".into())).unwrap();
         assert_eq!(load_from(&dir), None);
         let cleared = std::fs::read_to_string(dir.join(GAME_CONFIG_FILE)).unwrap();
         assert!(!cleared.contains("activePath"));
@@ -184,5 +183,23 @@ mod tests {
         let healed = std::fs::read_to_string(dir.join(GAME_CONFIG_FILE)).unwrap();
         assert_eq!(healed, canonical_toml(None).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_returns_an_error_and_preserves_legacy_settings() {
+        let dir = temp_dir("write-failure");
+        std::fs::create_dir(dir.join(GAME_CONFIG_FILE)).unwrap();
+        std::fs::write(
+            dir.join(LEGACY_GAME_CONFIG_FILE),
+            "{\"activePath\":\"old\"}",
+        )
+        .unwrap();
+        assert!(set_from(&dir, Some("new".into())).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LEGACY_GAME_CONFIG_FILE)).unwrap(),
+            "{\"activePath\":\"old\"}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
