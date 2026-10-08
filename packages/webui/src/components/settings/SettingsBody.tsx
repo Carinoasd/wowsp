@@ -2275,12 +2275,18 @@ export default defineComponent({
             <HkSettingsHint>
               {pickTelemetryNotice(lang.uiLocale.value).text}
             </HkSettingsHint>
-            <div class="stats-prefs__row">
-              <span class="stats-prefs__row-text">
-                <span class="stats-prefs__row-label">{t("settings.telemetryToggle")}</span>
-                <span class="stats-prefs__row-desc">{t("settings.telemetryToggleDesc")}</span>
-              </span>
-              <HkSwitch modelValue={analyticsEnabled.value} onUpdate:modelValue={setAnalyticsEnabled} />
+            {/* The row styles compile under `.stats-prefs .stats-prefs__row`
+                (see StatsPrefsControls.scss), so the group wrapper is what
+                gives the label/desc column and the right-aligned switch
+                their layout — without it the row renders unstyled. */}
+            <div class="stats-prefs">
+              <div class="stats-prefs__row">
+                <span class="stats-prefs__row-text">
+                  <span class="stats-prefs__row-label">{t("settings.telemetryToggle")}</span>
+                  <span class="stats-prefs__row-desc">{t("settings.telemetryToggleDesc")}</span>
+                </span>
+                <HkSwitch modelValue={analyticsEnabled.value} onUpdate:modelValue={setAnalyticsEnabled} />
+              </div>
             </div>
           </HkSettingsGroup>
           </>
