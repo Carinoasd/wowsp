@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,10 @@ static HUB_BUSY: AtomicBool = AtomicBool::new(false);
 /// Monotonic job-key counter — cancels address jobs by id, several jobs
 /// may share an id over time (mod packages reuse the entry id).
 static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const JOB_QUEUED: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_CANCELLED: u8 = 2;
 
 // ── Public request shape ──────────────────────────────────────────────────
 
@@ -189,6 +193,9 @@ struct Job {
     req: DownloadRequest,
     app: Option<AppHandle>,
     cancel: Arc<AtomicBool>,
+    /// Only the winner of QUEUED -> RUNNING may start a writer. A caller
+    /// that wins QUEUED -> CANCELLED can return before the worker is free.
+    state: Arc<AtomicU8>,
     waiter: tokio::sync::oneshot::Sender<Result<TransferDone, String>>,
     /// Registry key — distinct from `req.id` so repeated ids (mod
     /// packages) never collide in the cancel map.
@@ -203,9 +210,19 @@ pub async fn transfer(
     app: Option<&AppHandle>,
     req: DownloadRequest,
 ) -> Result<TransferDone, String> {
-    let hub = hub();
-    let (waiter, done) = tokio::sync::oneshot::channel();
+    transfer_on(hub(), app, req).await
+}
+
+/// The same queue protocol with a caller-owned worker for isolated tests.
+async fn transfer_on(
+    hub: &Hub,
+    app: Option<&AppHandle>,
+    req: DownloadRequest,
+) -> Result<TransferDone, String> {
+    let (waiter, mut done) = tokio::sync::oneshot::channel();
     let cancel = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(AtomicU8::new(JOB_QUEUED));
+    let cancel_msg = req.cancel_msg.clone();
     let key = format!(
         "{}/{}#{}",
         req.kind,
@@ -217,8 +234,7 @@ pub async fn transfer(
     }
     // Consume a cancel pressed while this pass was still resolving
     // (probes / manifest fetches run before the job is queued): the job
-    // dies the moment the worker dequeues it, like the static flag the
-    // old per-command engines used.
+    // fails without waiting for unrelated downloads ahead of it.
     {
         let scope = format!("{}/{}", req.kind, req.id);
         let consumed = match pending_cancels().lock() {
@@ -238,7 +254,8 @@ pub async fn transfer(
     let sent = hub.tx.send(Job {
         req,
         app: app.cloned(),
-        cancel,
+        cancel: Arc::clone(&cancel),
+        state: Arc::clone(&state),
         waiter,
         key: key.clone(),
     });
@@ -250,7 +267,28 @@ pub async fn transfer(
         }
         return Err("download hub worker is gone".to_string());
     }
-    match done.await {
+    let result = tokio::select! {
+        result = &mut done => result,
+        () = cancelled(&cancel) => {
+            if state.compare_exchange(
+                JOB_QUEUED,
+                JOB_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).is_ok() {
+                // The queued tombstone cannot start a writer. Remove only
+                // this attempt so it cannot absorb a retry's pending cancel.
+                if let Ok(mut map) = cancels().lock() {
+                    map.remove(&key);
+                }
+                return Err(cancel_msg);
+            }
+            // A writer already owns the part file. Do not release the
+            // caller until that writer has stopped and dropped its file.
+            done.await
+        }
+    };
+    match result {
         Ok(result) => result,
         Err(_) => Err("download job was dropped by the hub worker".to_string()),
     }
@@ -259,9 +297,9 @@ pub async fn transfer(
 /// Flag the queued or running job(s) under `(kind, id)` for
 /// cancellation. The running attempt interrupts pending network I/O,
 /// keeps its part file (resume base for a later retry) and fails with
-/// the request's `cancel_msg`; a still-queued job fails the moment it is
-/// dequeued. When no job is registered yet — the caller's resolve phase
-/// (version probes, manifest fetches) runs BEFORE `transfer` — the
+/// the request's `cancel_msg`; a still-queued job fails without waiting
+/// for the active download. When no job is registered yet — the caller's
+/// resolve phase (version probes, manifest fetches) runs BEFORE `transfer` — the
 /// request is remembered and consumed by the next `transfer` under the
 /// same key, so a cancel pressed during resolution is never lost.
 /// The kind scopes the match: a mod-hub entry literally named "update"
@@ -309,6 +347,17 @@ pub fn clear_pending(kind: &str, id: &str) {
 
 async fn worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>) {
     while let Some(job) = rx.recv().await {
+        if job
+            .state
+            .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if let Ok(mut map) = cancels().lock() {
+                map.remove(&job.key);
+            }
+            let _ = job.waiter.send(Err(job.req.cancel_msg));
+            continue;
+        }
         HUB_BUSY.store(true, Ordering::SeqCst);
         // Run the body in its own task: a panic inside one download must
         // fail that job, not kill the queue (every later job would hang).
@@ -941,6 +990,154 @@ mod tests {
         while !request.ends_with(b"\r\n\r\n") {
             request.push(socket.read_u8().await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn running_cancellation_waits_for_worker_completion() {
+        let scope = format!("test-running-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub { tx };
+        let req = DownloadRequest::new("running", &scope, Vec::new(), PathBuf::new());
+        let mut transfer = Box::pin(transfer_on(&hub, None, req));
+        assert!(futures::poll!(transfer.as_mut()).is_pending());
+        // Hold the worker's completion acknowledgment after it has claimed
+        // this job, as a writer still dropping its file would do.
+        let job = rx.try_recv().unwrap();
+        job.state
+            .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap();
+        cancel(&scope, "running");
+        tokio::time::sleep(CANCEL_TICK * 2).await;
+        assert!(futures::poll!(transfer.as_mut()).is_pending());
+        assert!(cancels().lock().unwrap().contains_key(&job.key));
+        cancels().lock().unwrap().remove(&job.key);
+        job.waiter
+            .send(Err("writer has stopped".to_string()))
+            .unwrap();
+        assert_eq!(transfer.await.unwrap_err(), "writer has stopped");
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_releases_the_waiter_without_starting_a_writer() {
+        let dir = test_directory();
+        let first_part = dir.join("first.part");
+        let queued_part = dir.join("queued.part");
+        let scope = format!("test-queue-{}", JOB_SEQ.fetch_add(1, Ordering::Relaxed));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release_first, released) = tokio::sync::oneshot::channel();
+        let (started, first_started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npre")
+                .await
+                .unwrap();
+            started.send(()).unwrap();
+            released.await.unwrap();
+            socket.write_all(b"fix").await.unwrap();
+            socket.shutdown().await.unwrap();
+            // No cancelled job may reach the network after dequeue.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /retry-success "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub { tx };
+        let worker = tokio::spawn(worker(rx));
+        let first = DownloadRequest::new(
+            "first",
+            &scope,
+            vec![format!("{base}/first")],
+            first_part.clone(),
+        );
+        let mut first = Box::pin(transfer_on(&hub, None, first));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(3), first_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let request = |path: &str| {
+            DownloadRequest::new(
+                "retry",
+                &scope,
+                vec![format!("{base}/{path}")],
+                queued_part.clone(),
+            )
+        };
+        let mut second = Box::pin(transfer_on(&hub, None, request("cancelled")));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        cancel(&scope, "retry");
+        let result = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("queued cancel must finish before the unrelated writer is released");
+        assert_eq!(result.unwrap_err(), "download cancelled");
+        assert!(!queued_part.exists());
+        assert!(
+            cancels()
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with(&format!("{scope}/retry#")))
+        );
+
+        // A retry has its own registry key. It must neither inherit the old
+        // cancel nor lose a new click to the cancelled queue tombstone.
+        let mut retry = Box::pin(transfer_on(&hub, None, request("retry-cancelled")));
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        tokio::time::sleep(CANCEL_TICK * 2).await;
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        cancel(&scope, "retry");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            "download cancelled"
+        );
+        assert!(!queued_part.exists());
+
+        // A cancel during retry resolution must become pending even while
+        // the old cancelled jobs remain in the worker's queue.
+        cancel(&scope, "retry");
+        let retry = transfer_on(&hub, None, request("cancelled-during-resolution"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            "download cancelled"
+        );
+        assert!(!queued_part.exists());
+
+        let mut successful_retry = Box::pin(transfer_on(&hub, None, request("retry-success")));
+        assert!(futures::poll!(successful_retry.as_mut()).is_pending());
+        release_first.send(()).unwrap();
+        let (first_result, retry_result) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(first, successful_retry)
+        })
+        .await
+        .unwrap();
+        first_result.unwrap();
+        retry_result.unwrap();
+        assert_eq!(std::fs::read(&first_part).unwrap(), b"prefix");
+        assert_eq!(std::fs::read(&queued_part).unwrap(), b"ok");
+        server.await.unwrap();
+        drop(hub);
+        worker.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
