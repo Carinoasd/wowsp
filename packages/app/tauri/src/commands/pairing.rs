@@ -80,6 +80,18 @@ pub const PAIRING_PROGRESS_EVENT: &str = "wowsp://pairing-progress";
 /// progress stream (no single "file" name to key on otherwise).
 pub const GAMEDATA_SENTINEL: &str = ":gamedata:";
 
+/// A stop budget must not detach the task: it could still publish old-session
+/// state or retain sockets after a replacement session starts.
+pub(super) async fn await_shutdown(
+    mut task: tokio::task::JoinHandle<()>,
+    budget: std::time::Duration,
+) {
+    if tokio::time::timeout(budget, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 /// Private scratch space for one server snapshot or client pull. Blocking
 /// builders/extractors retain an Arc so cancellation cannot remove their files
 /// while they are still using them, or let a later run reuse their paths.
@@ -948,7 +960,9 @@ pub fn pairing_get_status() -> PairingStatus {
 /// The desktop-side pairing server. Everything below is `#[cfg(desktop)]`.
 #[cfg(desktop)]
 pub(crate) mod server {
-    use std::net::{Ipv4Addr, TcpListener as StdListener};
+    use std::net::Ipv4Addr;
+    #[cfg(test)]
+    use std::net::TcpListener as StdListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
 
@@ -1043,6 +1057,13 @@ pub(crate) mod server {
         SERVER.get_or_init(|| Mutex::new(ServerState::default()))
     }
 
+    /// Server state and its global sidecars change as one lifecycle operation.
+    /// The relay-config command takes this same gate before restarting a bridge.
+    pub(crate) fn lifecycle_gate() -> &'static Mutex<()> {
+        static GATE: Mutex<()> = Mutex::const_new(());
+        &GATE
+    }
+
     pub fn current_status() -> PairingStatus {
         status_of(&state().blocking_lock())
     }
@@ -1127,8 +1148,8 @@ pub(crate) mod server {
         }
     }
 
-    /// Handle to a running server (also the test surface): the minted token
-    /// plus the shutdown signal.
+    /// Handle to a fixture server: the minted token plus its shutdown signal.
+    #[cfg(test)]
     pub struct ServerHandle {
         #[allow(dead_code)] // read via Debug/diagnostics in tests
         pub token: String,
@@ -1136,6 +1157,7 @@ pub(crate) mod server {
         task: tokio::task::JoinHandle<()>,
     }
 
+    #[cfg(test)]
     impl ServerHandle {
         /// Signal shutdown and WAIT for the accept loop to exit, so a
         /// restart on the same port cannot race the old listener.
@@ -1147,14 +1169,7 @@ pub(crate) mod server {
 
     // ── start / stop ────────────────────────────────────────────────────────
 
-    pub async fn pairing_start() -> Result<PairingStatus, String> {
-        // Fast path: already running (idempotent start).
-        {
-            let st = state().lock().await;
-            if st.running {
-                return Ok(status_of(&st));
-            }
-        }
+    async fn prepare_server() -> Result<ServerState, String> {
         let listener = bind_listener().await?;
         let port = listener
             .local_addr()
@@ -1204,34 +1219,45 @@ pub(crate) mod server {
             shutdown: rx,
         });
         let task = tokio::spawn(serve(listener, shared));
-        {
-            let mut st = state().lock().await;
-            // A concurrent start won the race — stop ours and report theirs.
-            if st.running {
-                drop(st);
-                ServerHandle {
-                    token,
-                    shutdown: tx,
-                    task,
-                }
-                .stop()
-                .await;
-                let st = state().lock().await;
-                return Ok(status_of(&st));
-            }
-            st.running = true;
-            st.host = host;
-            st.port = port;
-            st.pin = pin;
-            st.room = room.clone();
-            st.shutdown = Some(tx);
-            st.task = Some(task);
+        Ok(ServerState {
+            running: true,
+            host,
+            port,
+            pin,
+            room,
+            shutdown: Some(tx),
+            task: Some(task),
+        })
+    }
+
+    /// Returns whether a new run started; idempotent calls must not repeat the
+    /// optional gateway-code wait when an existing run is already available.
+    async fn start_with<P, S, F>(
+        state: &Mutex<ServerState>,
+        gate: &Mutex<()>,
+        prepare: P,
+        start_sidecars: S,
+    ) -> Result<bool, String>
+    where
+        P: std::future::Future<Output = Result<ServerState, String>>,
+        S: FnOnce(u16, String) -> F,
+        F: std::future::Future<Output = ()>,
+    {
+        let _lifecycle = gate.lock().await;
+        let mut st = state.lock().await;
+        if st.running {
+            return Ok(false);
         }
-        // Sidecars, strictly AFTER the state-lock win so a lost race never
-        // leaves them running: the UDP discovery broadcaster and — unless
-        // disabled in the hidden config — the relay host bridge toward the
-        // built-in gateway. Discovery no longer advertises a relay URL:
-        // the endpoint is built into both apps.
+        // Keep publication adjacent to preparation: once it spawns the serve
+        // task there is no await at which cancellation could orphan that task.
+        *st = prepare.await?;
+        let (port, room) = (st.port, st.room.clone());
+        drop(st);
+        start_sidecars(port, room).await;
+        Ok(true)
+    }
+
+    async fn start_sidecars(port: u16, room: String) {
         if let Err(e) = crate::commands::pairing_discovery::broadcast_start(port, None) {
             tracing::warn!(error = %e, "discovery broadcaster failed to start");
         }
@@ -1243,43 +1269,73 @@ pub(crate) mod server {
             {
                 tracing::warn!(error = %e, "relay host session failed to start");
             }
+        } else {
+            tracing::info!("internet gateway disabled by config — LAN-only pairing");
+        }
+    }
+
+    pub async fn pairing_start() -> Result<PairingStatus, String> {
+        let started =
+            start_with(state(), lifecycle_gate(), prepare_server(), start_sidecars).await?;
+        if started && crate::commands::pairing_relay::load_relay_config().enabled {
+            // Waiting for a code does not mutate lifecycle state; let stop run
+            // while the gateway is offline, and wake this wait when it stops.
+            let shutdown = state()
+                .lock()
+                .await
+                .shutdown
+                .as_ref()
+                .map(|s| s.subscribe());
             // Bounded wait so the status returned to the UI already carries
             // the gateway-allocated code when the gateway answers. A timeout
             // just means LAN-only for now: the bridge keeps retrying in the
             // background and the next status refresh picks the code up.
-            if let Err(e) =
-                crate::commands::pairing_relay::wait_for_code(std::time::Duration::from_secs(10))
-                    .await
-            {
-                tracing::info!(error = %e, "relay gateway unreachable — LAN-only pairing for now");
+            if let Some(mut shutdown) = shutdown {
+                if !*shutdown.borrow() {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => {},
+                        result = crate::commands::pairing_relay::wait_for_code(std::time::Duration::from_secs(10)) => {
+                            if let Err(e) = result {
+                                tracing::info!(error = %e, "relay gateway unreachable — LAN-only pairing for now");
+                            }
+                        },
+                    }
+                }
             }
-        } else {
-            tracing::info!("internet gateway disabled by config — LAN-only pairing");
         }
         let st = state().lock().await;
-        tracing::info!(host = %st.host, port, mode = ?status_of(&st).mode, "pairing server started");
+        tracing::info!(host = %st.host, port = st.port, mode = ?status_of(&st).mode, "pairing server started");
         Ok(status_of(&st))
     }
 
-    pub async fn pairing_stop() -> Result<(), String> {
+    async fn stop_with(
+        state: &Mutex<ServerState>,
+        gate: &Mutex<()>,
+        stop_sidecars: impl std::future::Future<Output = ()>,
+    ) {
+        let _lifecycle = gate.lock().await;
         let joined = {
-            let mut st = state().lock().await;
-            st.running = false;
-            st.host.clear();
-            st.pin.clear();
-            st.room.clear();
-            st.port = 0;
-            st.shutdown.take().zip(st.task.take())
+            let mut st = state.lock().await;
+            let old = std::mem::take(&mut *st);
+            old.shutdown.zip(old.task)
         };
         if let Some((tx, task)) = joined {
             let _ = tx.send(true);
             // Bounded wait: the accept loop only parks on accept/shutdown, so
             // it exits immediately; the bound guards against a pathological
             // in-flight request hanging stop forever.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            super::await_shutdown(task, std::time::Duration::from_secs(5)).await;
         }
-        crate::commands::pairing_discovery::broadcast_stop().await;
-        crate::commands::pairing_relay::host_session_stop().await;
+        stop_sidecars.await;
+    }
+
+    pub async fn pairing_stop() -> Result<(), String> {
+        stop_with(state(), lifecycle_gate(), async {
+            crate::commands::pairing_discovery::broadcast_stop().await;
+            crate::commands::pairing_relay::host_session_stop().await;
+        })
+        .await;
         tracing::info!("pairing server stopped");
         Ok(())
     }
@@ -1415,10 +1471,8 @@ pub(crate) mod server {
 
     /// Test surface: start serving on an ALREADY-BOUND listener with explicit
     /// replay root / gamedata zip / room id (the command path derives all of
-    /// those from the app dirs). Must be called inside a tokio runtime. Only
-    /// tests call this — the command path binds its own listener — hence the
-    /// allow.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// those from the app dirs). Must be called inside a tokio runtime.
+    #[cfg(test)]
     pub async fn spawn_on(
         listener: StdListener,
         replay_root: PathBuf,
@@ -2065,6 +2119,130 @@ pub(crate) mod server {
                 pin_throttle: std::sync::Mutex::new(PinThrottle::default()),
                 shutdown: shutdown_rx,
             })
+        }
+
+        fn fixture_state(port: u16) -> ServerState {
+            ServerState {
+                running: true,
+                host: "127.0.0.1".into(),
+                port,
+                pin: "123456".into(),
+                room: "a".repeat(64),
+                ..ServerState::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn repeated_start_keeps_the_existing_run_without_restarting_sidecars() {
+            let state = Mutex::new(fixture_state(1));
+            let gate = Mutex::new(());
+            let started = start_with(
+                &state,
+                &gate,
+                async { panic!("a running server must not be prepared again") },
+                |_, _| async { panic!("a running sidecar must not restart") },
+            )
+            .await
+            .unwrap();
+            assert!(!started, "an idempotent start skips the first-code wait");
+            assert_eq!(state.lock().await.port, 1);
+        }
+
+        #[tokio::test]
+        async fn stop_waits_for_pending_sidecar_start_before_retiring_the_run() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let state = Mutex::new(ServerState::default());
+            let gate = Mutex::new(());
+            let sidecar = AtomicBool::new(false);
+            let (release, ready) = tokio::sync::oneshot::channel();
+            let start = start_with(
+                &state,
+                &gate,
+                async { Ok(fixture_state(1)) },
+                |_, _| async {
+                    ready.await.unwrap();
+                    sidecar.store(true, Ordering::SeqCst);
+                },
+            );
+            tokio::pin!(start);
+            // The real start core has published the server, but its gateway
+            // setup is still awaiting an external result.
+            assert!(futures::poll!(&mut start).is_pending());
+            assert!(state.lock().await.running);
+            let stop = stop_with(&state, &gate, async {
+                sidecar.store(false, Ordering::SeqCst);
+            });
+            tokio::pin!(stop);
+            assert!(
+                futures::poll!(&mut stop).is_pending(),
+                "stop must not pass pending setup"
+            );
+            release.send(()).unwrap();
+            start.await.unwrap();
+            stop.await;
+            assert!(!state.lock().await.running);
+            assert!(!sidecar.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn restart_waits_until_old_stop_has_retired_all_sidecars() {
+            use std::sync::atomic::{AtomicU16, Ordering};
+            let gate = Mutex::new(());
+            let sidecar_port = AtomicU16::new(1);
+            let (release, retired) = tokio::sync::oneshot::channel();
+            let (shutdown, _receiver) = watch::channel(false);
+            let mut old = fixture_state(1);
+            old.shutdown = Some(shutdown);
+            old.task = Some(tokio::spawn(async {
+                retired.await.unwrap();
+            }));
+            let state = Mutex::new(old);
+            let stop = stop_with(&state, &gate, async {
+                sidecar_port.store(0, Ordering::SeqCst);
+            });
+            tokio::pin!(stop);
+            assert!(futures::poll!(&mut stop).is_pending());
+            assert!(!state.lock().await.running);
+            let start = start_with(&state, &gate, async { Ok(fixture_state(2)) }, |port, _| {
+                let sidecar_port = &sidecar_port;
+                async move {
+                    sidecar_port.store(port, Ordering::SeqCst);
+                }
+            });
+            tokio::pin!(start);
+            assert!(
+                futures::poll!(&mut start).is_pending(),
+                "restart must not overtake cleanup"
+            );
+            release.send(()).unwrap();
+            stop.await;
+            start.await.unwrap();
+            assert_eq!(state.lock().await.port, 2);
+            assert_eq!(sidecar_port.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn stop_budget_aborts_and_joins_a_stalled_session() {
+            let owner = Arc::new(());
+            let worker_owner = owner.clone();
+            let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+            let (started, running) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _owner = worker_owner;
+                started.send(()).unwrap();
+                let _ = stalled.await;
+            });
+            running.await.unwrap();
+            super::super::await_shutdown(task, std::time::Duration::from_millis(10)).await;
+            assert_eq!(
+                Arc::strong_count(&owner),
+                1,
+                "stop must not detach the old worker"
+            );
+            assert!(
+                release.send(()).is_err(),
+                "cancelled session must be gone before stop returns"
+            );
         }
 
         #[test]
