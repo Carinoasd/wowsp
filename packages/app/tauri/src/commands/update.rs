@@ -9,11 +9,16 @@
 //! IS the version truth — nothing has to be uploaded alongside a release
 //! for clients to notice it. The legacy `latest` marker file stays as a
 //! compatibility fallback for mirrors that serve the download mount but
-//! mangle the tag-page redirect. The first source to resolve a version wins
-//! the resolution ([`resolve_latest`], used by `update_check`).
+//! mangle the tag-page redirect. A probed version that is not a well-formed
+//! release version ([`is_valid_version`]) counts as a failed probe. The
+//! first source to resolve a version wins the resolution
+//! ([`resolve_latest`], used by `update_check`).
 //!
-//! `update_download` goes further: every source that resolved the version
-//! enters the unified download hub (`commands/download_hub.rs`) as one
+//! `update_download` never takes the version from a mirror: it installs the
+//! official latest release named by `api.github.com` and refuses anything
+//! not newer than the running build, so a stale or hostile mirror cannot
+//! turn an update into a downgrade. Every reachable source then enters the
+//! unified download hub (`commands/download_hub.rs`) as one
 //! FIFO-queued job — mirrors are probed in parallel (the race window
 //! reorders the ladder by throughput), a single writer streams the
 //! artifact into one version-scoped `.part` file, and a dying mirror
@@ -36,10 +41,11 @@
 //! `WoWSP_<version>_x64-installer.exe` as a byte-identical lite alias —
 //! pre-v0.3.1 updaters fetch exactly that; this build never does.
 //! Before any byte is accepted, the installer's sha256 is read from the
-//! official release API (`api.github.com`, never a mirror — the `digest`
-//! GitHub computes for every release asset) and the hub verifies the
-//! stream against it; no reachable digest or a mismatch on every mirror
-//! means no installer is spawned.
+//! same official release-API answer that named the version
+//! (`api.github.com`, never a mirror — the `digest` GitHub computes for
+//! every release asset) and the hub verifies the stream against it; no
+//! reachable digest or a mismatch on every mirror means no installer is
+//! spawned.
 //! The hardened installer kills the running app and installs over its
 //! directory, so the frontend treats the command's promise never resolving
 //! (app death) or resolving (installer spawned) as success by design; the
@@ -231,18 +237,21 @@ fn versioned_download_base(base: &str) -> String {
 
 // ── Artifact integrity (official digest) ─────────────────────────────────
 
-/// The official release API for one tag. Deliberately NOT routed through
-/// `github_mirror`: the digest is the trust anchor for installer bytes that
-/// may stream from third-party mirrors, so it must come from GitHub itself
-/// — a mirror able to serve both the artifact and its hash could forge both.
-fn release_api_url(version: &str) -> String {
-    format!("https://api.github.com/repos/langyo/wowsp/releases/tags/v{version}")
-}
+/// The official latest-release API. Deliberately NOT routed through
+/// `github_mirror`: it is the trust anchor for both the version an update
+/// installs and the digest of installer bytes that may stream from
+/// third-party mirrors, so it must come from GitHub itself — a mirror able
+/// to name the version and serve both the artifact and its hash could
+/// forge all of them. `releases/latest` only ever names a published `v*`
+/// app release: data, model and mod-hub releases are published with
+/// `make_latest=false`.
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/langyo/wowsp/releases/latest";
 
-/// Per-attempt cap on the digest lookup (the payload is a few KB).
+/// Per-attempt cap on the official release lookup (version + digest; the
+/// payload is a few KB).
 const DIGEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Attempts at the digest lookup before the update is refused.
+/// Attempts at the official release lookup before the update is refused.
 const DIGEST_ATTEMPTS: usize = 3;
 
 /// The lowercase sha256 GitHub computed for asset `name` in a release-API
@@ -259,15 +268,41 @@ fn asset_sha256(release: &serde_json::Value, name: &str) -> Option<String> {
         .then(|| hex.to_ascii_lowercase())
 }
 
-/// Fetch the official sha256 of the installer for `version`. Any failure
-/// is an `Err`: an installer that cannot be verified is never spawned.
-async fn fetch_official_sha256(client: &reqwest::Client, version: &str) -> Result<String> {
-    let url = release_api_url(version);
+/// The official latest release: the version to install and the sha256 of
+/// its lite installer.
+#[derive(Debug, PartialEq)]
+struct OfficialRelease {
+    version: String,
+    sha256: String,
+}
+
+/// Read the version (`tag_name`, strictly validated) and the lite
+/// installer digest out of a release-API payload.
+fn parse_official_release(release: &serde_json::Value) -> Result<OfficialRelease> {
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("the official release carries no tag name"))?;
+    let version = tag
+        .strip_prefix('v')
+        .filter(|version| is_valid_version(version))
+        .ok_or_else(|| anyhow!("the official release tag {tag:?} is not a release version"))?;
     let name = artifact_name(version);
+    let sha256 = asset_sha256(release, &name)
+        .ok_or_else(|| anyhow!("release v{version} publishes no sha256 digest for {name}"))?;
+    Ok(OfficialRelease {
+        version: version.to_string(),
+        sha256,
+    })
+}
+
+/// Fetch the official latest release and its installer sha256. Any failure
+/// is an `Err`: an installer that cannot be verified is never spawned.
+async fn fetch_official_release(client: &reqwest::Client) -> Result<OfficialRelease> {
+    let url = LATEST_RELEASE_API;
     let mut last_err = String::new();
     for _ in 0..DIGEST_ATTEMPTS {
         let response = client
-            .get(&url)
+            .get(url)
             .header("User-Agent", "WoWSP-updater")
             .header("Accept", "application/vnd.github+json")
             .timeout(DIGEST_TIMEOUT)
@@ -290,11 +325,10 @@ async fn fetch_official_sha256(client: &reqwest::Client, version: &str) -> Resul
                 continue;
             },
         };
-        return asset_sha256(&release, &name)
-            .ok_or_else(|| anyhow!("release v{version} publishes no sha256 digest for {name}"));
+        return parse_official_release(&release);
     }
     bail!(
-        "cannot verify the update (official digest unavailable: {last_err}); download it manually from GitHub Releases"
+        "cannot verify the update (official release unavailable: {last_err}); download it manually from GitHub Releases"
     )
 }
 
@@ -386,13 +420,20 @@ async fn probe_tag(client: &reqwest::Client, base: &str) -> Result<String> {
 /// forgotten marker file can never hide a published release. The legacy
 /// `latest` marker file stays as the compatibility fallback for mirrors
 /// that proxy the download mount but mangle the tag-page redirect.
+///
+/// The answer is mirror-controlled text that later lands in URLs and file
+/// names, so anything but a well-formed release version fails the probe.
 async fn probe_source(client: &reqwest::Client, base: &str, marker: &str) -> Result<String> {
-    match probe_tag(client, base).await {
-        Ok(version) => Ok(version),
+    let version = match probe_tag(client, base).await {
+        Ok(version) => version,
         Err(tag_err) => probe_marker(client, base, marker)
             .await
-            .map_err(|marker_err| anyhow!("tag probe: {tag_err}; marker probe: {marker_err}")),
+            .map_err(|marker_err| anyhow!("tag probe: {tag_err}; marker probe: {marker_err}"))?,
+    };
+    if !is_valid_version(&version) {
+        bail!("probe {base}: malformed version {version:?}");
     }
+    Ok(version)
 }
 
 /// One mirror that resolved the latest version.
@@ -460,6 +501,37 @@ async fn resolve_latest() -> Result<(String, String)> {
 
 // ── Version comparison ───────────────────────────────────────────────────
 
+/// Longest version string accepted from a source or the release API.
+const MAX_VERSION_LEN: usize = 64;
+
+/// Strict release-version shape, the bare form of this repo's `v*` tags:
+/// `^\d+\.\d+\.\d+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$` — `0.6.0`, plus an
+/// optional prerelease suffix like `0.7.0-beta.1`. Each core segment must
+/// fit a u64, so an overflowing segment can never be silently read as 0 by
+/// [`is_newer`] (which still compares prerelease suffixes loosely; the
+/// official `releases/latest` never names a prerelease). Versions are
+/// spliced into artifact URLs and temp file names, so nothing else (path
+/// separators, `..`, whitespace, query characters) may pass.
+fn is_valid_version(version: &str) -> bool {
+    if version.len() > MAX_VERSION_LEN {
+        return false;
+    }
+    let (core, prerelease) = match version.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (version, None),
+    };
+    let core: Vec<&str> = core.split('.').collect();
+    let core_ok = core.len() == 3
+        && core.iter().all(|seg| {
+            !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) && seg.parse::<u64>().is_ok()
+        });
+    let prerelease_ok = prerelease.is_none_or(|pre| {
+        pre.split('.')
+            .all(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+    });
+    core_ok && prerelease_ok
+}
+
 /// Segment-wise version comparison: split on `.`, parse each segment as u64
 /// (non-numeric counts as 0), zero-pad the shorter side; strictly greater
 /// wins. `0.1` equals `0.1.0`; `0.1` beats `0.0.9`.
@@ -475,6 +547,16 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     candidate.resize(len, 0);
     current.resize(len, 0);
     candidate > current
+}
+
+/// `update_download` only ever moves forward: an official latest release
+/// that is not newer than the running build (a downgrade or a reinstall)
+/// is refused before anything is downloaded.
+fn ensure_newer(latest: &str, current: &str) -> Result<()> {
+    if !is_newer(latest, current) {
+        bail!("no newer release to install (latest v{latest}, running {current})");
+    }
+    Ok(())
 }
 
 /// Version-check answer for the webui updater store.
@@ -542,11 +624,28 @@ async fn cleanup_part_files(keep: Option<&std::path::Path>) {
     }
 }
 
-/// Download the new installer and hand it to the OS. All mirrors that
-/// returned the marker enter the download hub as one job: the hub races
-/// the sources, streams through a single writer into the version-scoped
-/// part file (resuming across failed/cancelled passes) and walks its
-/// ladder on mirror death. On success the part file becomes
+/// The download ladder for `version`: every reachable source, the ones whose
+/// probe agreed with `version` first (each group in arrival order). The URL
+/// is versioned and the bytes are verified against the official digest, so
+/// a mirror whose `latest` redirect still names another release can still
+/// serve this one — its opinion of "latest" only orders the ladder, it
+/// never picks the artifact.
+fn download_sources(version: &str, candidates: &[SourceCandidate]) -> Vec<String> {
+    let (agreeing, others): (Vec<&SourceCandidate>, Vec<&SourceCandidate>) =
+        candidates.iter().partition(|c| c.version == version);
+    agreeing
+        .into_iter()
+        .chain(others)
+        .map(|c| artifact_url(&c.base, version))
+        .collect()
+}
+
+/// Download the new installer and hand it to the OS. The official latest
+/// release names the version (refused unless newer than the running
+/// build); every reachable mirror enters the download hub as one job: the
+/// hub races the sources, streams through a single writer into the
+/// version-scoped part file (resuming across failed/cancelled passes) and
+/// walks its ladder on mirror death. On success the part file becomes
 /// `WoWSP-update-<version>-<pid>.exe`, spawned with
 /// `--silent --dir=<install dir>`; returns after that spawn — the hardened
 /// installer then kills this app, installs over its directory and
@@ -570,11 +669,9 @@ async fn update_download_inner(app: &AppHandle, pass: &UpdatePass) -> Result<()>
     // user-initiated and must not inherit it.
     download_hub::clear_pending(kind::UPDATE, JOB_ID);
 
-    // ── Phase 1: mirror resolution race ────────────────────────────────
-    // Every source is probed in parallel with a 10 s cap each; all that
-    // resolve the latest version (in arrival order) enter the artifact
-    // race. The unified channel's race event lets the toast flip to its
-    // indeterminate strip while the probes settle.
+    // ── Phase 1: official version + mirror resolution race ─────────────
+    // The unified channel's race event lets the toast flip to its
+    // indeterminate strip while the lookups settle.
     let watch = watch_config()?;
     let marker = watch
         .files
@@ -582,21 +679,21 @@ async fn update_download_inner(app: &AppHandle, pass: &UpdatePass) -> Result<()>
         .ok_or_else(|| anyhow!("no marker file declared in the update sources"))?;
     let client = build_http_client()?;
     emit_phase(app, phase::RACE);
+    // The version comes from api.github.com, never from a mirror: the
+    // fastest mirror answering with an older tag must not turn the update
+    // into a downgrade (or a reinstall). The same answer carries the
+    // official digest every mirror byte is verified against; without it
+    // the update is refused.
+    let official = pass.run(fetch_official_release(&client)).await?;
+    ensure_newer(&official.version, APP_VERSION)?;
+    let version = official.version;
+    // Every source is probed in parallel with a 10 s cap each; all that
+    // answer enter the artifact race.
     let candidates = pass
         .run(race_sources(&client, &watch.sources, marker, true))
         .await?;
-    // Stale-mirror guard: a mirror still serving an older release would
-    // fetch a different artifact file — only sources agreeing with the
-    // winner stay in the race.
-    let version = candidates[0].version.clone();
-    let sources: Vec<String> = candidates
-        .iter()
-        .filter(|c| c.version == version)
-        .map(|c| artifact_url(&c.base, &version))
-        .collect();
-    // The official digest is fetched straight from api.github.com before a
-    // single mirror byte is accepted; without it the update is refused.
-    let expected_sha256 = pass.run(fetch_official_sha256(&client, &version)).await?;
+    let sources = download_sources(&version, &candidates);
+    let expected_sha256 = official.sha256;
     tracing::info!(%version, racers = sources.len(), "update download starting");
 
     // Version-scoped, pid-suffixed temp name: the part survives failed
@@ -739,7 +836,7 @@ mod tests {
             assert!(pass.cancel());
         };
         let outcome = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::join!(pass.run(fetch_official_sha256(&client, "0.5.4")), cancel)
+            tokio::join!(pass.run(fetch_official_release(&client)), cancel)
         })
         .await;
         server.abort();
@@ -871,6 +968,10 @@ mod tests {
             APP_VERSION.split('.').count() >= 2,
             "version carries at least major.minor: {APP_VERSION}"
         );
+        assert!(
+            is_valid_version(APP_VERSION),
+            "the running build's version passes the same strict check: {APP_VERSION}"
+        );
     }
 
     #[test]
@@ -984,12 +1085,178 @@ mod tests {
     }
 
     #[test]
-    fn release_api_url_targets_github_directly() {
-        // The digest source must never be a mirror prefix.
+    fn release_api_targets_github_directly() {
+        // The version + digest source must never be a mirror prefix.
         assert_eq!(
-            release_api_url("0.5.4"),
-            "https://api.github.com/repos/langyo/wowsp/releases/tags/v0.5.4"
+            LATEST_RELEASE_API,
+            "https://api.github.com/repos/langyo/wowsp/releases/latest"
         );
+    }
+
+    #[test]
+    fn release_versions_are_accepted() {
+        for version in [
+            "0.1.0",
+            "0.4.11",
+            "0.6.0",
+            "1.0.0",
+            "10.20.30",
+            "0.7.0-beta",
+            "0.7.0-beta.1",
+            "0.1.0-rc.1",
+            "1.0.0-0.3.7",
+        ] {
+            assert!(is_valid_version(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn malformed_versions_are_rejected() {
+        for version in [
+            "",
+            "0.6",
+            "0.6.0.1",
+            "v0.6.0",
+            "V0.6.0",
+            " 0.6.0",
+            "0.6.0\n",
+            "0.6.0-",
+            "0.6.0-beta.",
+            "0.6.0-beta..1",
+            "0.6.0-be-ta",
+            "0.6.0+build.1",
+            "0.6.0-be/ta",
+            "0.6.0/../../evil",
+            "../../../evil",
+            "0.6.0?x=1",
+            "0.6.0#frag",
+            "0.6.0%2F..",
+            "0..0",
+            "a.b.c",
+            "-1.0.0",
+            "+1.0.0",
+            "99999999999999999999.0.0",
+            "latest",
+            "res-latest",
+            "<html>",
+        ] {
+            assert!(!is_valid_version(version), "{version:?}");
+        }
+        let long = format!("0.6.0-{}", "a".repeat(MAX_VERSION_LEN));
+        assert!(!is_valid_version(&long), "over-long");
+    }
+
+    #[test]
+    fn update_download_refuses_a_downgrade() {
+        // The attack: a stale or hostile source names v0.5.4 (a pre-digest
+        // build whose own updater verifies nothing).
+        let err = ensure_newer("0.5.4", "0.6.1").unwrap_err().to_string();
+        assert!(err.contains("no newer release"), "{err}");
+        assert!(ensure_newer("0.6.0", "0.6.1").is_err());
+        assert!(ensure_newer("0.6.1", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn update_download_refuses_the_running_version() {
+        assert!(ensure_newer("0.6.1", "0.6.1").is_err());
+    }
+
+    #[test]
+    fn update_download_accepts_a_newer_release() {
+        assert!(ensure_newer("0.6.2", "0.6.1").is_ok());
+        assert!(ensure_newer("0.7.0", "0.6.9").is_ok());
+        assert!(ensure_newer("1.0.0", "0.99.99").is_ok());
+    }
+
+    #[test]
+    fn mixed_mirror_versions_never_pick_the_artifact() {
+        let candidate = |base: &str, version: &str| SourceCandidate {
+            base: base.to_string(),
+            version: version.to_string(),
+        };
+        // Arrival order: a stale mirror answers first, a hostile one claims
+        // a bogus higher release, and the up-to-date sources come last.
+        let candidates = [
+            candidate(
+                "https://ghfast.top/https://github.com/langyo/wowsp/releases/latest/download",
+                "0.5.4",
+            ),
+            candidate(
+                "https://ghp.ci/https://github.com/langyo/wowsp/releases/latest/download",
+                "9.9.9",
+            ),
+            candidate(
+                "https://github.com/langyo/wowsp/releases/latest/download",
+                "0.6.2",
+            ),
+            candidate(
+                "https://gh-proxy.com/https://github.com/langyo/wowsp/releases/latest/download",
+                "0.6.2",
+            ),
+        ];
+        // The official version decides; agreeing sources lead the ladder
+        // and every source fetches the official version's artifact.
+        assert_eq!(
+            download_sources("0.6.2", &candidates),
+            vec![
+                "https://github.com/langyo/wowsp/releases/download/v0.6.2/WoWSP_0.6.2_x64-installer-lite.exe",
+                "https://gh-proxy.com/https://github.com/langyo/wowsp/releases/download/v0.6.2/WoWSP_0.6.2_x64-installer-lite.exe",
+                "https://ghfast.top/https://github.com/langyo/wowsp/releases/download/v0.6.2/WoWSP_0.6.2_x64-installer-lite.exe",
+                "https://ghp.ci/https://github.com/langyo/wowsp/releases/download/v0.6.2/WoWSP_0.6.2_x64-installer-lite.exe",
+            ]
+        );
+        // Even when no mirror agrees, the official version is fetched.
+        assert_eq!(
+            download_sources("0.6.3", &candidates[..1]),
+            vec![
+                "https://ghfast.top/https://github.com/langyo/wowsp/releases/download/v0.6.3/WoWSP_0.6.3_x64-installer-lite.exe"
+            ]
+        );
+    }
+
+    #[test]
+    fn official_release_names_the_version_and_digest() {
+        let hex = "8d88e539c25d9b8a0705c9f858f616e68f6d8ef13af4de7a00af39fb10593927";
+        let release = serde_json::json!({
+            "tag_name": "v0.6.0",
+            "assets": [
+                { "name": "WoWSP_0.6.0_x64-installer-lite.exe", "digest": format!("sha256:{hex}") },
+            ]
+        });
+        assert_eq!(
+            parse_official_release(&release).unwrap(),
+            OfficialRelease {
+                version: "0.6.0".to_string(),
+                sha256: hex.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn official_release_rejects_malformed_tags_and_missing_digests() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for tag in [
+            serde_json::Value::Null,
+            "0.6.0".into(),
+            "v0.6".into(),
+            "v../../evil".into(),
+            "res-latest".into(),
+            "v0.6.0/../x".into(),
+        ] {
+            let release = serde_json::json!({
+                "tag_name": tag,
+                "assets": [{ "name": "WoWSP_0.6.0_x64-installer-lite.exe", "digest": digest }]
+            });
+            assert!(parse_official_release(&release).is_err(), "{tag}");
+        }
+        let without_lite = serde_json::json!({
+            "tag_name": "v0.6.0",
+            "assets": [{ "name": "WoWSP_0.6.0_x64-installer.exe", "digest": digest }]
+        });
+        let err = parse_official_release(&without_lite)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("publishes no sha256 digest"), "{err}");
     }
 
     #[test]
