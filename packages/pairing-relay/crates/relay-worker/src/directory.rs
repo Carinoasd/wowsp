@@ -5,7 +5,10 @@
 //! provisionable on the Workers free plan) and re-arms the expiry alarm.
 //!
 //! Internal routes (dialed by the Room DO and the main worker only):
-//!   GET /bind?room=<64hex>&hostId=<hex, optional>  → {"code":"NNNNNN"}
+//!   GET /bind?room=<64hex>&ip=<host-ip>&hostId=<hex, optional>
+//!                                                  → {"code":"NNNNNN"}
+//!                                                    | 429 (live-code cap reached)
+//!                                                    | 503 (code space exhausted)
 //!   GET /lookup?code=NNNNNN&ip=<client-ip>         → {"room":"<64hex>"}
 //!                                                    | 404 | 429 (rate limited)
 
@@ -13,8 +16,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use relay_core::directory::{
-    AllocateDelta, CodeEntry, CodeRng, Directory as CodeDirectory, RateState, ResolveOutcome,
-    code_key, host_key_storage, rate_key,
+    AllocError, AllocateDelta, CodeEntry, CodeRng, Directory as CodeDirectory,
+    GLOBAL_FAILURE_ALERT, RateState, ResolveOutcome, code_key, host_key_storage, rate_key,
 };
 use relay_core::{valid_code, valid_host_id, valid_room};
 use worker::*;
@@ -63,22 +66,33 @@ impl DurableObject for Directory {
         }
     }
 
-    /// Expiry sweep: drop dead rows from storage, re-arm to the earliest
-    /// live expiry (or clear the alarm when nothing is live).
+    /// Expiry sweep: drop dead rows from storage, re-arm to the next
+    /// deadline (earliest code expiry or stale rate row), or clear the
+    /// alarm when nothing is left.
     async fn alarm(&self) -> Result<Response> {
         self.ensure_loaded().await?;
         let now = Date::now().as_millis();
-        let (removed, next) = {
+        let removed = {
             let mut slot = self.dir.borrow_mut();
             let Some(dir) = slot.as_mut() else {
                 return not_hydrated();
             };
-            dir.sweep(now)
+            dir.sweep(now).0
         };
         let storage = self.state.storage();
         if !removed.is_empty() {
             let _ = storage.delete_multiple(removed).await;
         }
+        // Recompute after the await: a bind or lookup that ran meanwhile
+        // may have added a deadline (and found no pending alarm, since
+        // this one is firing), which a pre-await value would cancel.
+        let next = {
+            let slot = self.dir.borrow();
+            let Some(dir) = slot.as_ref() else {
+                return not_hydrated();
+            };
+            dir.next_deadline()
+        };
         self.arm_alarm(next).await;
         Response::ok("swept")
     }
@@ -137,6 +151,7 @@ impl Directory {
             return Response::error("bad room key", 400);
         }
         let host_id = relay_core::route::query_get(query, "hostId").filter(|h| valid_host_id(h));
+        let ip = relay_core::route::query_get(query, "ip").unwrap_or("unknown");
         let now = Date::now().as_millis();
         let mut rng = SystemCodeRng;
         let delta: Result<AllocateDelta, _> = {
@@ -144,12 +159,13 @@ impl Directory {
             let Some(dir) = slot.as_mut() else {
                 return not_hydrated();
             };
-            dir.allocate(now, &mut rng, room, host_id)
+            dir.allocate(now, &mut rng, ip, room, host_id)
         };
         let storage = self.state.storage();
         let delta = match delta {
             Ok(delta) => delta,
-            Err(_) => return Response::error("code space exhausted", 503),
+            Err(AllocError::RateLimited) => return Response::error("rate limited", 429),
+            Err(AllocError::Exhausted) => return Response::error("code space exhausted", 503),
         };
         let _ = storage
             .put(&code_key(&delta.code), delta.entry.clone())
@@ -163,14 +179,7 @@ impl Directory {
         if !delta.removed.is_empty() {
             let _ = storage.delete_multiple(delta.removed.clone()).await;
         }
-        let next = {
-            let slot = self.dir.borrow();
-            let Some(dir) = slot.as_ref() else {
-                return not_hydrated();
-            };
-            dir.entries().map(|(_, e)| e.expires_at).min()
-        };
-        self.arm_alarm(next).await;
+        self.arm_if_idle(delta.entry.expires_at).await;
         Response::from_json(&serde_json::json!({ "code": delta.code }))
     }
 
@@ -183,18 +192,35 @@ impl Directory {
         }
         let ip = relay_core::route::query_get(query, "ip").unwrap_or("unknown");
         let now = Date::now().as_millis();
-        let (outcome, rate) = {
+        let (outcome, rows, alert) = {
             let mut slot = self.dir.borrow_mut();
             let Some(dir) = slot.as_mut() else {
                 return not_hydrated();
             };
-            dir.resolve(now, ip, code)
+            let (outcome, rows) = dir.resolve(now, ip, code);
+            (outcome, rows, dir.take_failure_alert())
         };
+        if alert {
+            console_warn!(
+                "pairing directory: {GLOBAL_FAILURE_ALERT} failed code resolves within a minute \
+                 (possible distributed guessing)"
+            );
+        }
+        // Only rows this resolve changed are written: a refusal of an
+        // already-blocked client costs no storage write.
         let storage = self.state.storage();
-        if rate.failures.is_empty() && rate.blocked_until.is_none() {
-            let _ = storage.delete(&rate_key(ip)).await;
-        } else {
-            let _ = storage.put(&rate_key(ip), rate).await;
+        let mut latest_deadline: Option<u64> = None;
+        for (bucket, state) in rows {
+            latest_deadline = latest_deadline.max(state.dead_at());
+            if state.is_empty() {
+                let _ = storage.delete(&rate_key(&bucket)).await;
+            } else {
+                let _ = storage.put(&rate_key(&bucket), state).await;
+            }
+        }
+        // Rate rows must be swept even while no code is live.
+        if let Some(deadline) = latest_deadline {
+            self.arm_if_idle(deadline).await;
         }
         match outcome {
             ResolveOutcome::Room(room) => {
@@ -214,6 +240,18 @@ impl Directory {
             },
             ResolveOutcome::Unknown => Response::error("unknown code", 404),
             ResolveOutcome::RateLimited => Response::error("rate limited", 429),
+        }
+    }
+
+    /// Arm the sweep alarm for `deadline` unless one is already pending.
+    /// A pending alarm is always re-armed by the sweep to the true next
+    /// deadline, so this never needs to scan the tables; a deadline that
+    /// lands before the pending alarm is merely swept a little late
+    /// (resolve checks expiries itself, so that is harmless).
+    async fn arm_if_idle(&self, deadline: u64) {
+        let storage = self.state.storage();
+        if storage.get_alarm().await.ok().flatten().is_none() {
+            self.arm_alarm(Some(deadline)).await;
         }
     }
 

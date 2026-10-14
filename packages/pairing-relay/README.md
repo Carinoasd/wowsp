@@ -74,9 +74,19 @@ phone ──wss control/data ──▶ WORKER (this package) ◀──wss── 
 
 ### Server-side pairing policy (all in `relay-core`, all unit-tested)
 
-- **One active code per host** — allocation keys by the `hello` hostId
-  (v1 fallback: the room key). Regenerating, or a desktop restart with
-  the same hostId, kills the previous code instantly.
+- **One active code per host and per room** — allocation keys by the
+  `hello` hostId (v1 fallback: the room key). Regenerating, or a desktop
+  restart with the same hostId, kills the previous code instantly; so
+  does any new allocation for the same room. A host control socket may
+  say `hello` only once — a second one closes the socket (1008) — so one
+  socket can never hold more than one live code.
+- **Live-code caps** — a source may hold at most 32 live codes per
+  IPv4 address (generous for carrier NAT) and 8 / 16 / 32 per IPv6 /64 /
+  /56 / /48. A replacement retires a code as it mints one, so
+  regenerating never counts; the caps are rebuilt from the stored code
+  rows after an eviction. A capped `allocate` is answered
+  `{"type":"allocFailed"}` only after a 45 s hold, which paces the
+  desktop's reconnect-and-retry loop without a client change.
 - **10-minute code TTL**, alarm-swept in the Directory DO; bindings and
   the resolved-IP claim are persisted in DO storage so they survive
   eviction.
@@ -84,9 +94,18 @@ phone ──wss control/data ──▶ WORKER (this package) ◀──wss── 
   client IP (from `CF-Connecting-IP`); the SAME IP may re-resolve to
   reconnect within the TTL, any other IP is refused (and is
   indistinguishable from an unknown code, so it leaks nothing).
-- **Per-IP brute-force guard** — more than 10 failed resolves in a
-  sliding minute rejects that IP for 60 s with
-  `{"type":"error","code":"rate_limited"}` (even for valid codes).
+- **Tiered brute-force guard** — failed resolves are counted per tier in
+  a sliding minute: an IPv4 address or an IPv6 /64 may miss 10 times, an
+  IPv6 /56 20 times and a /48 30 times; the next miss blocks that tier
+  for 60 s with `{"type":"error","code":"rate_limited"}` (even for
+  valid codes). IPv4 has no /24 tier: carrier NAT neighbours are
+  unrelated users. There is no global gate — a gateway-wide count of
+  120 misses per minute only logs a warning for the operator.
+- **Deployment note** — the per-prefix tiers read `CF-Connecting-IP`.
+  Keep the zone's *Network → Pseudo IPv4* setting **Off** or **Add
+  Header**: *Overwrite Headers* replaces IPv6 client addresses with
+  per-address Class E IPv4s, which silently turns every IPv6 /128 into
+  its own tier.
 - **Room limits** — max **4 concurrent data connections** per room
   (5th `open` gets `{"type":"error","code":"conn_limit"}`); binary
   frames are capped at **256 KiB** (`{"type":"error","code":"frame_too_large","size":N}`

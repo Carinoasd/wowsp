@@ -8,14 +8,17 @@
 //! 15-minute idle TTL); phones hold client control sockets and the two
 //! data halves of each opened connection.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use futures_util::StreamExt;
 use relay_core::protocol::{InboundFrame, OutboundFrame, error_codes, welcome};
-use relay_core::room::{AttachOutcome, FrameVerdict, OpenError, RoomConns, Side, frame_verdict};
+use relay_core::room::{
+    AttachOutcome, FrameVerdict, HelloVerdict, HostControl, OpenError, RoomConns, Side,
+    frame_verdict,
+};
 use relay_core::route::{Route, classify};
-use relay_core::{valid_conn_id, valid_host_id, valid_room};
+use relay_core::{valid_conn_id, valid_room};
 use worker::{WebsocketEvent, *};
 
 /// Rooms idle longer than this are torn down by the alarm.
@@ -31,6 +34,14 @@ const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const CLOSE_GOING_AWAY: u16 = 1001;
 /// WS close code for a normal teardown.
 const CLOSE_NORMAL: u16 = 1000;
+/// WS close code for a protocol abuse (a second `hello` on a host socket).
+const CLOSE_POLICY_VIOLATION: u16 = 1008;
+/// How long a host whose allocation hit the Directory's live-code cap
+/// waits for its `allocFailed`. The desktop answers `allocFailed` by
+/// reconnecting after a 1 s backoff, so replying at once would make a
+/// capped desktop redial every second; holding the reply paces it to
+/// one attempt per ~45 s with no client change.
+const ALLOC_THROTTLE_HOLD_MS: u64 = 45_000;
 
 /// Both halves of one data connection, plus early frames buffered while
 /// the second half's handshake is still in flight (the phone can win the
@@ -74,8 +85,14 @@ impl DurableObject for Room {
         let url = req.url()?;
         let query = url.query().unwrap_or("").to_string();
         let path = url.path().to_string();
+        // The client address of the original request (the main worker
+        // forwards it untouched); host sockets allocate under it.
+        let ip = req
+            .headers()
+            .get("CF-Connecting-IP")?
+            .unwrap_or_else(|| "local".to_string());
         match classify(&path, &query) {
-            Route::Control { room, role } => self.control(room, role).await,
+            Route::Control { room, role } => self.control(room, role, ip).await,
             Route::Data {
                 room,
                 conn_id,
@@ -120,7 +137,12 @@ impl Room {
 
     // ── control sockets ────────────────────────────────────────────────
 
-    async fn control(&self, room: Option<&str>, role: Option<&str>) -> Result<Response> {
+    async fn control(
+        &self,
+        room: Option<&str>,
+        role: Option<&str>,
+        ip: String,
+    ) -> Result<Response> {
         let Some(room) = room.filter(|r| valid_room(r)) else {
             return Response::error("bad room key", 400);
         };
@@ -162,7 +184,7 @@ impl Room {
             for client in waiting {
                 let _ = client.send_with_str(&OutboundFrame::Ready.to_text());
             }
-            self.spawn_host_reader(server);
+            self.spawn_host_reader(server, ip);
         } else {
             let (greeting, owner) = {
                 let mut inner = self.inner.borrow_mut();
@@ -187,13 +209,19 @@ impl Room {
     }
 
     /// The desktop bridge's control socket: handshakes, code allocation,
-    /// conn signals. Any inbound text refreshes the idle TTL.
-    fn spawn_host_reader(&self, server: WebSocket) {
+    /// conn signals. Any inbound text refreshes the idle TTL. One `hello`
+    /// per socket; allocations are attributed to the socket's client
+    /// address `ip` for the Directory's live-code caps.
+    fn spawn_host_reader(&self, server: WebSocket, ip: String) {
         let inner = self.inner.clone();
         let storage = Rc::new(self.state.storage());
         let env = self.env.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut host_id: Option<String> = None;
+            let mut handshake = HostControl::new();
+            // Set while a capped allocation's delayed allocFailed is
+            // pending; further allocates on the socket are dropped until
+            // it is sent (no Directory call per spammed frame).
+            let holding = Rc::new(Cell::new(false));
             let mut events = match server.events() {
                 Ok(events) => events,
                 Err(_) => return,
@@ -209,19 +237,40 @@ impl Room {
                     .set_alarm((Date::now().as_millis() + ROOM_IDLE_TTL_MS) as i64)
                     .await;
                 match InboundFrame::parse(&text) {
-                    InboundFrame::Hello { host_id: id, .. } => {
-                        if valid_host_id(&id) {
-                            host_id = Some(id);
-                        }
-                        let _ = server.send_with_str(&welcome().to_text());
+                    InboundFrame::Hello { host_id: id, .. } => match handshake.hello(&id) {
+                        HelloVerdict::Welcome => {
+                            let _ = server.send_with_str(&welcome().to_text());
+                        },
+                        HelloVerdict::Duplicate => {
+                            let _ =
+                                server.close(Some(CLOSE_POLICY_VIOLATION), Some("duplicate hello"));
+                            break;
+                        },
                     },
                     InboundFrame::Allocate => {
+                        if holding.get() {
+                            continue;
+                        }
                         let room = inner.borrow().room_key.clone();
                         let Some(room) = room else { continue };
-                        match allocate_via_directory(&env, &room, host_id.as_deref()).await {
-                            Ok(code) => {
+                        match allocate_via_directory(&env, &room, handshake.host_id(), &ip).await {
+                            Ok(Bind::Code(code)) => {
                                 let _ = server
                                     .send_with_str(&OutboundFrame::Code { code, room }.to_text());
+                            },
+                            Ok(Bind::Capped) => {
+                                holding.set(true);
+                                let socket = server.clone();
+                                let holding = holding.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    Delay::from(std::time::Duration::from_millis(
+                                        ALLOC_THROTTLE_HOLD_MS,
+                                    ))
+                                    .await;
+                                    let _ =
+                                        socket.send_with_str(&OutboundFrame::AllocFailed.to_text());
+                                    holding.set(false);
+                                });
                             },
                             Err(_) => {
                                 let _ = server.send_with_str(&OutboundFrame::AllocFailed.to_text());
@@ -452,23 +501,35 @@ fn teardown_conn(inner: &RefCell<RoomInner>, conn_id: &str) {
     }
 }
 
+/// A Directory bind answer the host reader acts on.
+enum Bind {
+    /// The freshly minted code.
+    Code(String),
+    /// 429: the source's live-code cap is reached.
+    Capped,
+}
+
 /// Ask the singleton Directory DO for a fresh code bound to
-/// `(host_id, room)`.
+/// `(host_id, room)`, charged to the host socket's client address `ip`.
 async fn allocate_via_directory(
     env: &Env,
     room: &str,
     host_id: Option<&str>,
-) -> Result<String, Error> {
+    ip: &str,
+) -> Result<Bind, Error> {
     let stub = env
         .durable_object("DIRECTORY")?
         .id_from_name(DIRECTORY_NAME)?
         .get_stub()?;
-    let mut url = format!("https://directory/bind?room={room}");
+    let mut url = format!("https://directory/bind?room={room}&ip={ip}");
     if let Some(host_id) = host_id {
         url.push_str("&hostId=");
         url.push_str(host_id);
     }
     let mut resp = stub.fetch_with_str(&url).await?;
+    if resp.status_code() == 429 {
+        return Ok(Bind::Capped);
+    }
     if resp.status_code() != 200 {
         return Err(Error::RustError(format!(
             "directory bind failed ({})",
@@ -481,6 +542,6 @@ async fn allocate_via_directory(
     parsed
         .get("code")
         .and_then(|c| c.as_str())
-        .map(str::to_string)
+        .map(|code| Bind::Code(code.to_string()))
         .ok_or_else(|| Error::RustError("directory returned no code".into()))
 }
