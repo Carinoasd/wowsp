@@ -12,8 +12,12 @@
 //!   feedback Bitable's tenant token AND the /erp console's Feishu-OAuth
 //!   login (see src/erp.rs; the console APIs gate on the signed session
 //!   cookie, the old `FEEDBACK_ADMIN_KEY` header gate is retired).
-//! - `FEEDBACK_ADMIN_OPEN_ID` (var, optional) — granted `full_access` on
-//!   the bootstrap-created Bitable so a human can open it in Feishu.
+//! - `FEEDBACK_ADMIN_OPEN_ID` (var or secret, optional) — granted
+//!   `full_access` on the bootstrap-created Bitable so a human can open it
+//!   in Feishu; also always on the /erp console allowlist.
+//! - `ERP_ALLOWED_OPEN_IDS` (secret or var, optional) — comma-separated
+//!   open_ids admitted to the /erp console on top of the admin (see
+//!   src/erp.rs; unset together with the admin = the legacy open gate).
 //! - `FEEDBACK_BITABLE_APP_TOKEN` / `FEEDBACK_BITABLE_TABLE_ID` (vars,
 //!   optional) — pin to a pre-existing base instead of bootstrapping one.
 //! - `FEEDBACK_TURNSTILE_BYPASS` (secret, OPTIONAL, smoke tests only) —
@@ -470,10 +474,23 @@ async fn record_contact(token: &str, ids: &BitableIds, record_id: &str) -> Optio
 }
 
 /// POST /api/feedback/update {record_id, status?, pr_link?} — the console's
-/// review transition (and what fix-agents call to mark 已开PR).
+/// review transition (and what fix-agents call to mark 已开PR). Browser
+/// requests must be same-origin (the Lax session cookie would still ride
+/// a same-site POST from a sibling subdomain); header-less non-browser
+/// clients pass on the cookie alone.
 pub async fn handle_update(mut req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Post {
         return err(405, "method_not_allowed");
+    }
+    let own_origin = req.url()?.origin().ascii_serialization();
+    let fetch_origin = req.headers().get("Origin").ok().flatten();
+    let fetch_site = req.headers().get("Sec-Fetch-Site").ok().flatten();
+    if !relay_core::erp::same_origin_write(
+        fetch_origin.as_deref(),
+        fetch_site.as_deref(),
+        &own_origin,
+    ) {
+        return err(403, "cross_origin");
     }
     if !crate::erp::session_ok(&req, &env) {
         return err(401, "unauthorized");
