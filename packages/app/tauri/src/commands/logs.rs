@@ -9,6 +9,11 @@
 //!
 //! All paths are backend-derived (never frontend-supplied), so nothing
 //! here can be aimed at arbitrary filesystem locations.
+//!
+//! Everything that leaves through these commands (the clipboard tail and
+//! every text file in the bundle) passes [`Redactor`] first — user name /
+//! home folder, LAN and IPv6 addresses, URL query secrets, account ids.
+//! The files on disk stay raw.
 
 use anyhow::anyhow;
 use std::io::Write as _;
@@ -18,6 +23,7 @@ use serde::Serialize;
 
 use wowsp_tauri_shared::CommandResult;
 
+use crate::logging::redact::Redactor;
 use crate::logging::{self, LogFile};
 
 /// Cap the tail read: enough lines to carry the incident, never a whole
@@ -114,7 +120,8 @@ pub fn logs_reveal_latest(app: tauri::AppHandle) -> CommandResult<()> {
 }
 
 /// Tauri command: read the last `lines` lines (default 120, max 1000) of
-/// the newest log file, as UTF-8 text for clipboard sharing. A partial
+/// the newest log file, as UTF-8 text for clipboard sharing — redacted
+/// like the bundle, since a pasted tail travels just as far. A partial
 /// multibyte character at the window edge degrades to the replacement
 /// character on that one line only.
 #[tauri::command]
@@ -145,7 +152,7 @@ pub fn logs_read_tail(lines: Option<usize>) -> CommandResult<String> {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(tail)
+    Ok(Redactor::from_env().redact(&tail))
 }
 
 /// Tauri command: write a feedback bundle into the logs folder and reveal
@@ -153,7 +160,9 @@ pub fn logs_read_tail(lines: Option<usize>) -> CommandResult<String> {
 /// (newest first under a 32 MiB budget; the newest ALWAYS ships — as its
 /// tail when oversized, since a runaway log is exactly the report worth
 /// making) plus a UTF-8 `feedback-info.txt` header (app version, OS,
-/// build flavor, portable mode, file manifest). Returns the bundle path.
+/// build flavor, portable mode, file manifest). Every text entry is
+/// redacted on the way in (see [`Redactor`]); the files on disk are not
+/// touched. Returns the bundle path.
 /// Exported bundles stay in the folder until the user deletes them (the
 /// roller never touches them — its prune scan matches only its own
 /// naming, and so does the overview listing).
@@ -225,6 +234,7 @@ fn export_bundle_sync(app: &tauri::AppHandle, include_hardware: bool) -> anyhow:
         None
     };
 
+    let redactor = Redactor::from_env();
     let file = std::fs::File::create(&bundle_path)
         .map_err(|e| anyhow!("create {}: {e}", bundle_path.display()))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -233,13 +243,16 @@ fn export_bundle_sync(app: &tauri::AppHandle, include_hardware: bool) -> anyhow:
 
     zip.start_file("feedback-info.txt", opts)
         .map_err(|e| anyhow!("bundle header: {e}"))?;
-    zip.write_all(&feedback_info(&dir, &sources, hardware.as_ref()))
+    zip.write_all(&feedback_info(&dir, &sources, hardware.as_ref(), &redactor))
         .map_err(|e| anyhow!("bundle header: {e}"))?;
 
     if let Some(report) = &hardware {
         zip.start_file("hardware-info.txt", opts)
             .map_err(|e| anyhow!("bundle hardware report: {e}"))?;
-        zip.write_all(&report.render_bom())
+        // No IP rule here: driver / firmware versions look like private
+        // IPv4, and the report carries no addresses.
+        let text = redactor.redact_report(&String::from_utf8_lossy(&report.render_bom()));
+        zip.write_all(text.as_bytes())
             .map_err(|e| anyhow!("bundle hardware report: {e}"))?;
     }
 
@@ -253,9 +266,10 @@ fn export_bundle_sync(app: &tauri::AppHandle, include_hardware: bool) -> anyhow:
         } else {
             &bytes
         };
+        let entry = redactor.redact(&String::from_utf8_lossy(entry));
         zip.start_file(name.as_str(), opts)
             .map_err(|e| anyhow!("bundle {name}: {e}"))?;
-        zip.write_all(entry)
+        zip.write_all(entry.as_bytes())
             .map_err(|e| anyhow!("bundle {name}: {e}"))?;
     }
     zip.finish()
@@ -279,10 +293,13 @@ fn export_bundle_sync(app: &tauri::AppHandle, include_hardware: bool) -> anyhow:
 /// mojibake-ing the CJK paths inside. When a hardware report rides along,
 /// its one-line summary (OS / CPU / board / GPU + the elevation status)
 /// goes here too, so a bundle can be triaged without opening the report.
+/// The whole header is redacted (`log-dir:` sits under the user's profile
+/// unless portable).
 fn feedback_info(
     dir: &std::path::Path,
     sources: &[(String, PathBuf, u64)],
     hardware: Option<&super::hardware_info::HardwareReport>,
+    redactor: &Redactor,
 ) -> Vec<u8> {
     let mut manifest = String::new();
     manifest.push_str("WoWSP feedback bundle\n");
@@ -351,8 +368,15 @@ fn feedback_info(
     }
     manifest.push_str("\nnote: 日志文件为 UTF-8 编码，每行一条事件。\n");
     manifest.push_str("note: log files are UTF-8 text, one event per line.\n");
+    manifest.push_str(
+        "note: 导出时已遮蔽用户名/用户目录、局域网与 IPv6 地址、URL 查询参数中的搜索词与密钥；日志字段、接口路径与缓存文件名中的账号 ID 只保留末 4 位。\n",
+    );
+    manifest.push_str(
+        "note: user name / home folder, LAN and IPv6 addresses and URL query search terms / keys are masked on export; account ids in log fields, API paths and cache file names keep their last 4 digits.\n",
+    );
     manifest.push_str("note: hardware-info.txt 在应用内弹窗确认后收集，仅用于问题分析。\n");
 
+    let manifest = redactor.redact(&manifest);
     let mut bytes = Vec::with_capacity(manifest.len() + 3);
     bytes.extend_from_slice("\u{feff}".as_bytes());
     bytes.extend_from_slice(manifest.as_bytes());
@@ -403,7 +427,7 @@ mod tests {
             dir.join("wowsp.2026-09-29.log"),
             1024u64,
         )];
-        let bytes = feedback_info(&dir, &sources, None);
+        let bytes = feedback_info(&dir, &sources, None, &Redactor::default());
         assert_eq!(&bytes[..3], "\u{feff}".as_bytes());
         let text = String::from_utf8(bytes).expect("manifest is UTF-8");
         assert!(text.contains("encoding: UTF-8"));
@@ -413,6 +437,31 @@ mod tests {
             text.contains("hardware-info: skipped"),
             "logs-only export must say so"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn feedback_info_masks_the_log_dir() {
+        // `log-dir:` is `%APPDATA%\WoWSP\logs` on a normal install — the
+        // user's profile folder must not ride along in the header.
+        let dir = temp_dir("info-redact");
+        let home = dir.parent().expect("temp dir has a parent");
+        let redactor = Redactor::new([home.display().to_string()], [], []);
+        let sources = vec![(
+            "wowsp.2026-10-14.log".to_string(),
+            dir.join("wowsp.2026-10-14.log"),
+            1024u64,
+        )];
+        let bytes = feedback_info(&dir, &sources, None, &redactor);
+        let text = String::from_utf8(bytes).expect("manifest is UTF-8");
+        let log_dir = text
+            .lines()
+            .find(|l| l.starts_with("log-dir: "))
+            .expect("manifest keeps its log-dir line");
+        assert!(log_dir.starts_with("log-dir: %USERPROFILE%"), "{log_dir}");
+        assert!(!text.contains(&home.display().to_string()));
+        assert!(text.contains("wowsp.2026-10-14.log"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -443,7 +492,7 @@ mod tests {
             "t",
             vec![("adapter".into(), "RTX 4070 — driver 32.0.15.6094".into())],
         );
-        let bytes = feedback_info(&dir, &sources, Some(&report));
+        let bytes = feedback_info(&dir, &sources, Some(&report), &Redactor::default());
         let text = String::from_utf8(bytes).expect("manifest is UTF-8");
         assert!(text.contains("hardware-info: hardware-info.txt (elevation: elevated"));
         assert!(text.contains("hw-os: Windows 11 专业版"));
@@ -476,7 +525,7 @@ mod tests {
                 ("adapter 1".into(), "RTX 4070 — driver 32.0.15".into()),
             ],
         );
-        let bytes = feedback_info(&dir, &sources, Some(&report));
+        let bytes = feedback_info(&dir, &sources, Some(&report), &Redactor::default());
         let text = String::from_utf8(bytes).expect("manifest is UTF-8");
         assert!(text.contains("hw-gpu: Arc 130T — driver 32.0.101"));
 

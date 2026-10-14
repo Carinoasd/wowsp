@@ -25,6 +25,7 @@
     "avatar": "Supporter avatars",
     "avatarCdn": "Avatar CDN",
     "shipImages": "Ship images",
-    "relay": "Pairing relay"
+    "relay": "Pairing relay",
+    "analytics": "Usage telemetry (Google Analytics)"
   }
 }

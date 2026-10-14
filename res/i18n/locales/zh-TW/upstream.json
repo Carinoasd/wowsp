@@ -25,6 +25,7 @@
     "avatar": "支持者頭像",
     "avatarCdn": "頭像圖床",
     "shipImages": "艦艇圖片",
-    "relay": "手機配對中繼"
+    "relay": "手機配對中繼",
+    "analytics": "使用量遙測（Google Analytics）"
   }
 }

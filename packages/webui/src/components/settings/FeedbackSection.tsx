@@ -163,9 +163,10 @@ export default defineComponent({
     }
 
     /** The hardware-consent dialog. The full export sweeps the machine's
-     *  identifying hardware data (disk serials, every NIC's MAC, …), so it
-     *  ONLY runs after this explicit disclosure — the log-only export stays
-     *  one click away, and cancel keeps everything local. */
+     *  identifying hardware data (disk / RAM / board serials, every NIC's
+     *  MAC, …), so it ONLY runs after this explicit disclosure. The
+     *  log-only export is the primary (default) action, the full export
+     *  an explicit secondary choice, and Cancel keeps everything local. */
     const exportArmed = ref(false);
 
     async function exportBundle(includeHardware: boolean) {
@@ -320,16 +321,21 @@ export default defineComponent({
           width="34rem"
           footerActions={[
             {
-              label: t("settings.feedbackHwExportLogs"),
+              label: t("settings.feedbackHwCancel"),
               variant: "secondary",
-              disabled: exporting.value,
-              onClick: () => void exportBundle(false),
+              onClick: () => (exportArmed.value = false),
             },
             {
               label: t("settings.feedbackHwExportFull"),
+              variant: "secondary",
+              disabled: exporting.value,
+              onClick: () => void exportBundle(true),
+            },
+            {
+              label: t("settings.feedbackHwExportLogs"),
               variant: "primary",
               loading: exporting.value,
-              onClick: () => void exportBundle(true),
+              onClick: () => void exportBundle(false),
             },
           ]}
         >
@@ -343,10 +349,12 @@ export default defineComponent({
             <ul class="feedback-hw__items">
               <li>{t("settings.feedbackHwItemModels")}</li>
               <li>{t("settings.feedbackHwItemSerial")}</li>
+              <li>{t("settings.feedbackHwItemVolumes")}</li>
               <li>{t("settings.feedbackHwItemEnv")}</li>
               <li>{t("settings.feedbackHwItemDriver")}</li>
             </ul>
             <p class="feedback-hw__note">{t("settings.feedbackHwPrivacy")}</p>
+            <p class="feedback-hw__note">{t("settings.feedbackHwLogsNote")}</p>
             <p class="feedback-hw__uac">{t("settings.feedbackHwUac")}</p>
           </div>
         </HkModal>

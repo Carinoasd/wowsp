@@ -28,6 +28,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+pub mod redact;
+
 /// Folder name for the log sink, under the writable data root.
 pub const LOG_DIR_NAME: &str = "logs";
 
