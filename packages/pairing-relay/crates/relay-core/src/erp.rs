@@ -1,17 +1,21 @@
 //! The `/erp` review console — the Hikari page plus the pure half of its
 //! Feishu-OAuth session protocol.
 //!
-//! Auth story: a Feishu OAuth login (any authenticated user of the app)
-//! mints an HMAC-signed session cookie; every console API
-//! (`/api/feedback/list`, `/api/feedback/update`, the attachment
+//! Auth story: a Feishu OAuth login by an allowlisted open_id
+//! (`ERP_ALLOWED_OPEN_IDS` ∪ `FEEDBACK_ADMIN_OPEN_ID`; with neither set,
+//! any user the Feishu app admits — the legacy gate, logged and flagged
+//! in the console) mints an HMAC-signed session cookie; every console
+//! API (`/api/feedback/list`, `/api/feedback/update`, the attachment
 //! redirect) accepts that cookie instead of the retired `X-Admin-Key`
-//! header. The signed state is the SHA-256 of a domain-separated app
-//! secret, so no extra secret is needed on top of the existing
-//! `FEISHU_APP_SECRET`.
+//! header, re-checking the open_id it carries against the allowlist so
+//! removing someone revokes their live sessions. The signed state is the
+//! SHA-256 of a domain-separated app secret, so no extra secret is
+//! needed on top of the existing `FEISHU_APP_SECRET`.
 //!
 //! Pure here (host-testable): the page rendering, HMAC-SHA256, unpadded
-//! base64url, cookie-header parsing, session mint/verify and the
-//! authorize-URL shape. The I/O half — the OAuth round trips — lives in
+//! base64url, cookie-header parsing, session mint/verify, the open_id
+//! allowlist, the same-origin write check and the authorize-URL shape.
+//! The I/O half — the OAuth round trips — lives in
 //! `relay-worker/src/erp.rs`.
 
 use serde::{Deserialize, Serialize};
@@ -156,6 +160,76 @@ pub fn read_session(key: &[u8; 32], value: &str, now_secs: i64) -> Option<Sessio
     }
     let claims: SessionClaims = serde_json::from_slice(&b64url_decode(payload)?).ok()?;
     (claims.exp > now_secs).then_some(claims)
+}
+
+// ── console allowlist ─────────────────────────────────────────────────
+
+/// Who may hold a console session: the open_ids listed in
+/// `ERP_ALLOWED_OPEN_IDS` (comma- or whitespace-separated) plus
+/// `FEEDBACK_ADMIN_OPEN_ID`. Both unset (or blank) leaves the list
+/// empty, which keeps the legacy gate — any user the Feishu app lets
+/// sign in — so an upgrade never locks the owner out; the worker logs a
+/// warning and the console flags it (see [`ConsoleAllowlist::is_open`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsoleAllowlist {
+    open_ids: Vec<String>,
+}
+
+impl ConsoleAllowlist {
+    /// Union of the two config values; blanks and stray separators are
+    /// ignored (open_ids never contain commas or whitespace).
+    pub fn from_config(allowed: Option<&str>, admin: Option<&str>) -> Self {
+        let mut open_ids: Vec<String> = Vec::new();
+        for raw in [allowed, admin].into_iter().flatten() {
+            for id in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+                if !id.is_empty() && !open_ids.iter().any(|known| known == id) {
+                    open_ids.push(id.to_string());
+                }
+            }
+        }
+        Self { open_ids }
+    }
+
+    /// No open_id configured — the legacy any-app-user gate is in force.
+    pub fn is_open(&self) -> bool {
+        self.open_ids.is_empty()
+    }
+
+    /// Whether `open_id` may log in / keep using a session. An empty
+    /// open_id is never admitted, open mode or not.
+    pub fn admits(&self, open_id: &str) -> bool {
+        !open_id.is_empty() && (self.is_open() || self.open_ids.iter().any(|id| id == open_id))
+    }
+}
+
+/// The console APIs' session gate: signature + expiry ([`read_session`])
+/// AND the open_id the cookie was minted for is still allowlisted — so
+/// dropping someone from the list revokes their unexpired cookies on the
+/// next request instead of after the 7-day TTL.
+pub fn read_console_session(
+    key: &[u8; 32],
+    value: &str,
+    now_secs: i64,
+    allowlist: &ConsoleAllowlist,
+) -> Option<SessionClaims> {
+    read_session(key, value, now_secs).filter(|c| allowlist.admits(&c.open_id))
+}
+
+/// CSRF guard for cookie-authenticated writes: a browser request must be
+/// same-origin. `Sec-Fetch-Site` (when sent) must be `same-origin` and
+/// `Origin` (when sent) must equal the worker's own origin. Requests
+/// carrying neither header — non-browser clients such as fix-agents
+/// replaying a session cookie — pass; the cookie itself (SameSite=Lax)
+/// remains the authentication.
+pub fn same_origin_write(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    own_origin: &str,
+) -> bool {
+    if sec_fetch_site.is_some_and(|site| !site.trim().eq_ignore_ascii_case("same-origin")) {
+        return false;
+    }
+    origin.is_none_or(|o| o.trim() == own_origin)
 }
 
 // ── small wire helpers ────────────────────────────────────────────────
@@ -569,7 +643,8 @@ h2.e-title {{ font-size: var(--text-md); font-weight: 600; margin: 0; }}
   function showLogin(reason) {{
     app.hidden = true;
     loginView.hidden = false;
-    if (reason) toast("登录失败（" + reason + "），请重试。", "error");
+    if (reason === "denied") toast("该飞书账号不在后台允许名单内，请联系维护者。", "error");
+    else if (reason) toast("登录失败（" + reason + "），请重试。", "error");
     $("who").hidden = true;
     $("logout").hidden = true;
   }}
@@ -708,6 +783,10 @@ h2.e-title {{ font-size: var(--text-md); font-weight: 600; margin: 0; }}
         if (j.debug && j.debug !== "refreshed") {{
           toast("通讯录读取: " + j.debug, "error");
         }}
+        if (j.open_access) {{
+          toast("未配置后台允许名单：任何能登录该飞书应用的人都能进入。请把你的 open_id（" +
+            j.open_access + "）写入 ERP_ALLOWED_OPEN_IDS。", "error");
+        }}
       }} else {{
         var params = new URLSearchParams(location.search);
         showLogin(params.get("login") === "failed" ? params.get("reason") || "unknown" : "");
@@ -808,6 +887,115 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_parses_the_union_of_both_settings() {
+        let list = ConsoleAllowlist::from_config(Some(" ou_a, ou_b ,,\nou_c "), Some("ou_admin"));
+        for id in ["ou_a", "ou_b", "ou_c", "ou_admin"] {
+            assert!(list.admits(id), "{id}");
+        }
+        assert!(!list.is_open());
+        assert!(!list.admits("ou_other"));
+        // Exact match only — no prefix, case or substring slack.
+        assert!(!list.admits("ou_"));
+        assert!(!list.admits("OU_A"));
+        assert!(!list.admits("ou_ab"));
+        assert!(!list.admits(""));
+        // Either setting alone is enough to close the gate.
+        let only_admin = ConsoleAllowlist::from_config(None, Some("ou_admin"));
+        assert!(only_admin.admits("ou_admin") && !only_admin.admits("ou_a"));
+        let only_list = ConsoleAllowlist::from_config(Some("ou_a"), None);
+        assert!(only_list.admits("ou_a") && !only_list.admits("ou_admin"));
+        // Duplicates across the two settings collapse.
+        assert_eq!(
+            ConsoleAllowlist::from_config(Some("ou_a,ou_a"), Some("ou_a")),
+            ConsoleAllowlist::from_config(Some("ou_a"), None)
+        );
+    }
+
+    #[test]
+    fn unset_allowlist_keeps_the_legacy_open_gate() {
+        // Both unset, or set to nothing but separators, is open mode:
+        // any non-empty open_id the Feishu app admits gets in.
+        for (allowed, admin) in [(None, None), (Some(""), Some("  ")), (Some(" , ,"), None)] {
+            let list = ConsoleAllowlist::from_config(allowed, admin);
+            assert!(list.is_open(), "{allowed:?} {admin:?}");
+            assert!(list.admits("ou_anyone"));
+            assert!(!list.admits(""), "an empty open_id never passes");
+        }
+    }
+
+    #[test]
+    fn console_sessions_follow_the_allowlist() {
+        let key = session_key("app-secret");
+        let claims = |open_id: &str| SessionClaims {
+            open_id: open_id.into(),
+            name: "伊欧".into(),
+            avatar: "https://example.test/a.png".into(),
+            exp: 1000,
+        };
+        let owner = mint_session(&key, &claims("ou_owner"));
+        let ex = mint_session(&key, &claims("ou_ex"));
+        let list = ConsoleAllowlist::from_config(Some("ou_owner"), None);
+        assert_eq!(
+            read_console_session(&key, &owner, 0, &list),
+            Some(claims("ou_owner"))
+        );
+        // A validly signed, unexpired cookie for someone no longer on the
+        // list is refused immediately — no waiting out the 7-day TTL.
+        assert!(read_session(&key, &ex, 0).is_some());
+        assert_eq!(read_console_session(&key, &ex, 0, &list), None);
+        // The allowlist never rescues a bad signature or an expired one.
+        assert_eq!(read_console_session(&key, &owner, 1000, &list), None);
+        assert_eq!(
+            read_console_session(&session_key("other"), &owner, 0, &list),
+            None
+        );
+        // Open mode admits any signed session with an open_id, but not a
+        // signed one that somehow carries none.
+        let open = ConsoleAllowlist::default();
+        assert!(read_console_session(&key, &ex, 0, &open).is_some());
+        let blank = mint_session(&key, &claims(""));
+        assert_eq!(read_console_session(&key, &blank, 0, &open), None);
+    }
+
+    #[test]
+    fn writes_must_be_same_origin_when_a_browser_says_so() {
+        let own = "https://wowsp.langyo.xyz";
+        // The console's own fetch: same-origin by both signals.
+        assert!(same_origin_write(Some(own), Some("same-origin"), own));
+        // Non-browser clients (fix-agents, curl) send neither header.
+        assert!(same_origin_write(None, None, own));
+        // Either signal alone is honored.
+        assert!(same_origin_write(Some(own), None, own));
+        assert!(same_origin_write(None, Some("same-origin"), own));
+        // Cross-site and same-site (a sibling subdomain the Lax cookie
+        // would still ride along to) are both refused.
+        assert!(!same_origin_write(
+            Some("https://evil.example"),
+            Some("cross-site"),
+            own
+        ));
+        assert!(!same_origin_write(
+            Some("https://x.langyo.xyz"),
+            Some("same-site"),
+            own
+        ));
+        assert!(!same_origin_write(None, Some("cross-site"), own));
+        assert!(!same_origin_write(None, Some("none"), own));
+        assert!(!same_origin_write(Some("null"), None, own));
+        assert!(!same_origin_write(
+            Some("http://wowsp.langyo.xyz"),
+            None,
+            own
+        ));
+        // A forged-looking pair still fails on the Origin mismatch.
+        assert!(!same_origin_write(
+            Some("https://evil.example"),
+            Some("same-origin"),
+            own
+        ));
+    }
+
+    #[test]
     fn cookie_get_survives_real_headers() {
         assert_eq!(
             cookie_get("a=1; erp_session=abc123", "erp_session"),
@@ -882,6 +1070,10 @@ mod tests {
         assert!(page.contains("function toast(msg, kind)"));
         assert!(page.contains(r#"toast("已保存 ""#));
         assert!(page.contains("登录失败（"));
+        // An allowlist refusal reads as such, and open mode is flagged.
+        assert!(page.contains(r#"reason === "denied""#));
+        assert!(page.contains("j.open_access"));
+        assert!(page.contains("ERP_ALLOWED_OPEN_IDS"));
         assert!(!page.contains("loginErr"));
         assert!(!page.contains("e-err"));
         assert!(!page.contains("e-toast"));

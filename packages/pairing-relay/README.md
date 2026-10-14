@@ -193,11 +193,19 @@ and `/erp` are answered by this worker itself — they sit in
   gated): lists records, flips 处理状态, writes PR links, downloads
   attachments through `/api/feedback/attachment` (302 to a Feishu
   temporary URL). Login is the app's own Feishu OAuth — the callback
-  mints an HMAC-signed session cookie (7 days) and any authenticated
-  app user gets console access.
+  mints an HMAC-signed session cookie (7 days) for open_ids on the
+  console allowlist (`ERP_ALLOWED_OPEN_IDS` ∪ `FEEDBACK_ADMIN_OPEN_ID`,
+  see [Console access](#console-access-erp_allowed_open_ids)); everyone
+  else lands back on the login page with `reason=denied`.
 - **`GET /api/feedback/list` / `POST /api/feedback/update`** — the JSON
   surface behind the console, also what fix-agents consume (the same
-  session cookie; the old `X-Admin-Key` header gate is retired).
+  session cookie; the old `X-Admin-Key` header gate is retired). There
+  is no separate agent credential: a fix-agent replays an `erp_session`
+  cookie copied from a maintainer's logged-in browser, so it carries
+  that maintainer's open_id and lives or dies with it on the allowlist.
+  `update` additionally refuses browser requests that are not
+  same-origin (`Origin` / `Sec-Fetch-Site`); header-less clients such as
+  fix-agents are unaffected.
 
 Anti-abuse is layered: Turnstile (human check) → KV counters (speed) →
 every record starts as 待审查 and only matters once a human flips it.
@@ -208,6 +216,7 @@ every record starts as 待审查 and only matters once a human flips it.
 npx wrangler secret put FEISHU_APP_ID        # 飞书自建应用 app_id (cli_…)
 npx wrangler secret put FEISHU_APP_SECRET    # … its app_secret
 npx wrangler secret put TURNSTILE_SECRET     # Turnstile widget secret key
+npx wrangler secret put ERP_ALLOWED_OPEN_IDS # /erp allowlist: ou_…,ou_… (see below)
 # FEEDBACK_ADMIN_KEY is retired — /erp now logs in via Feishu OAuth.
 # The app's 开放平台 安全设置 must list <origin>/api/erp/callback as a
 # 重定向 URL for the login round trip to land.
@@ -215,10 +224,58 @@ npx wrangler secret put TURNSTILE_SECRET     # Turnstile widget secret key
 #   TURNSTILE_SITEKEY        — Turnstile sitekey (public; form shows a
 #                              maintenance notice until it is set)
 #   FEEDBACK_ADMIN_OPEN_ID   — optional; granted full_access on the
-#                              bootstrapped Bitable so a human can open it
+#                              bootstrapped Bitable so a human can open it,
+#                              and always on the /erp allowlist (a secret
+#                              works too, and survives deploys — see below)
 #   FEEDBACK_BITABLE_APP_TOKEN / FEEDBACK_BITABLE_TABLE_ID — optional pin
 #                              to a pre-existing base instead of bootstrap
 ```
+
+The optional settings (`ERP_ALLOWED_OPEN_IDS`, `FEEDBACK_*`) are read
+with workers-rs `env.var`, which sees plaintext vars and secrets alike.
+Note that `wrangler deploy` (and therefore the Deploy
+Site workflow) **deletes dashboard-set plaintext vars** that are not in
+`wrangler.toml` (no `keep_vars` here) — secrets are never touched by a
+deploy, which is why the allowlist goes in as a secret.
+
+#### Console access (`ERP_ALLOWED_OPEN_IDS`)
+
+The Feishu app being 自建 only limits login to the tenant members inside
+its 可用范围; the console narrows that further to an explicit allowlist:
+
+- **Allowed** = `ERP_ALLOWED_OPEN_IDS` (open_ids separated by commas or
+  whitespace) ∪ `FEEDBACK_ADMIN_OPEN_ID`. The open_ids are THIS app's
+  (`ou_…`, app-scoped — the same id `FEEDBACK_ADMIN_OPEN_ID` already
+  uses for the Bitable grant).
+- **Checked twice** — at the OAuth callback (not listed → redirected to
+  `/erp?login=failed&reason=denied`, no cookie) and on every console
+  request against the open_id inside the signed cookie, so deleting an
+  open_id from the list revokes that person's (and any fix-agent's
+  copy of their) unexpired cookies on the very next request instead of
+  after the 7-day TTL.
+- **Set it as a secret.** Do not rely on a dashboard-only
+  `FEEDBACK_ADMIN_OPEN_ID` var to close the gate: the next deploy deletes
+  it and the console silently falls back to the open mode below.
+- **Neither set** — the legacy gate stays: anyone the Feishu app lets in
+  gets the console. This keeps an upgrade from locking the owner out
+  (failing closed would shut the console on deploy, before anyone has
+  configured the list). Every such login writes a `console.warn` to the
+  worker log, and every console page load shows an error toast with the
+  logged-in open_id — paste it into the secret to close the gate. A
+  refused login is logged too (`erp: denied open_id …`, visible in
+  `npx wrangler tail`), which is the easy way to learn a new
+  maintainer's open_id before adding it:
+
+```sh
+npx wrangler secret put ERP_ALLOWED_OPEN_IDS   # e.g. ou_xxx,ou_yyy
+# remove someone: put the list again without them (takes effect at once)
+# back to the legacy open gate (not recommended):
+npx wrangler secret delete ERP_ALLOWED_OPEN_IDS
+```
+
+Fix-agents need no change as long as the open_id their copied cookie
+was minted for stays allowlisted; a cookie minted for anyone else stops
+working the moment the list is set.
 
 The Bitable is bootstrapped by the worker on first submission: it creates
 the base「WoWSP 反馈」+ the 反馈 table (schema in

@@ -12,14 +12,19 @@
 //! - `GET /api/erp/session` — the console shell's whoami probe.
 //! - `POST /api/erp/logout` — clears the session cookie.
 //!
-//! Any authenticated Feishu user of the app gets console access — this
-//! is the maintainer's personal tool, and the app is the owner's own.
+//! Access is limited to an open_id allowlist — `ERP_ALLOWED_OPEN_IDS`
+//! (comma-separated) ∪ `FEEDBACK_ADMIN_OPEN_ID`, checked at the callback
+//! AND on every session use, so removing an open_id revokes its live
+//! cookies. With neither set the legacy gate stays (any user the Feishu
+//! app admits) so an upgrade never locks the owner out; each such login
+//! logs a warning and the session probe flags it to the console.
 //! Session signing derives from `FEISHU_APP_SECRET` (domain-separated),
 //! so no extra secret is needed.
 
 use relay_core::erp::{
-    OAUTH_STATE_COOKIE, OAUTH_STATE_TTL_SECS, SESSION_COOKIE, SESSION_TTL_SECS, SessionClaims,
-    authorize_url, cookie_get, ct_eq, mint_session, read_session, session_key,
+    ConsoleAllowlist, OAUTH_STATE_COOKIE, OAUTH_STATE_TTL_SECS, SESSION_COOKIE, SESSION_TTL_SECS,
+    SessionClaims, authorize_url, cookie_get, ct_eq, mint_session, read_console_session,
+    session_key,
 };
 use relay_core::feedback::urlencode;
 use relay_core::route::query_get;
@@ -173,6 +178,20 @@ pub async fn handle_callback(req: Request, env: Env) -> Result<Response> {
     if claims.open_id.is_empty() {
         return login_failed(&origin, "profile-shape");
     }
+    let allowlist = allowlist(&env);
+    if !allowlist.admits(&claims.open_id) {
+        // Logged so the owner can read a new maintainer's app-scoped
+        // open_id off `wrangler tail` before adding it to the list.
+        worker::console_log!("erp: denied open_id {}", claims.open_id);
+        return login_failed(&origin, "denied");
+    }
+    if allowlist.is_open() {
+        worker::console_warn!(
+            "erp: no ERP_ALLOWED_OPEN_IDS / FEEDBACK_ADMIN_OPEN_ID configured; \
+             admitting open_id {} under the legacy any-app-user gate",
+            claims.open_id
+        );
+    }
 
     // Best-effort enrichment: user_info anonymizes the profile to
     // 用户＋digits when the app lacks contact visibility, which reads as
@@ -219,8 +238,14 @@ pub async fn handle_session(req: Request, env: Env) -> Result<Response> {
     let Some(c) = session_claims(&req, &env) else {
         return ok(json!({ "ok": false }));
     };
+    // Open mode (no allowlist configured) is surfaced to the session
+    // holder together with their own open_id — exactly the value the
+    // owner needs to close the gate.
+    let open_access = allowlist(&env).is_open().then(|| c.open_id.clone());
     if !relay_core::erp::profile_needs_refresh(&c.name, &c.avatar) {
-        return ok(json!({ "ok": true, "name": c.name, "avatar": c.avatar }));
+        return ok(json!({
+            "ok": true, "name": c.name, "avatar": c.avatar, "open_access": open_access
+        }));
     }
     // The profile read is attempted live on every probe while the stored
     // claims are the placeholder; the contact failure code rides back to
@@ -228,7 +253,8 @@ pub async fn handle_session(req: Request, env: Env) -> Result<Response> {
     match refresh_profile(&env, c.clone()).await {
         Ok(Some(fresh)) => {
             let mut resp = ok(json!({
-                "ok": true, "name": fresh.name, "avatar": fresh.avatar, "debug": "refreshed"
+                "ok": true, "name": fresh.name, "avatar": fresh.avatar, "debug": "refreshed",
+                "open_access": open_access
             }))?;
             if let Some(app_secret) = env.secret("FEISHU_APP_SECRET").ok().map(|s| s.to_string()) {
                 let value = mint_session(&session_key(&app_secret), &fresh);
@@ -244,10 +270,12 @@ pub async fn handle_session(req: Request, env: Env) -> Result<Response> {
         // The contact read failed again (权限 still missing) — serve the
         // stored claims and report WHY to the session holder.
         Ok(None) => ok(json!({
-            "ok": true, "name": c.name, "avatar": c.avatar, "debug": "unchanged"
+            "ok": true, "name": c.name, "avatar": c.avatar, "debug": "unchanged",
+            "open_access": open_access
         })),
         Err(d) => ok(json!({
-            "ok": true, "name": c.name, "avatar": c.avatar, "debug": d
+            "ok": true, "name": c.name, "avatar": c.avatar, "debug": d,
+            "open_access": open_access
         })),
     }
 }
@@ -268,8 +296,9 @@ pub async fn handle_logout(req: Request, env: Env) -> Result<Response> {
     Ok(resp)
 }
 
-/// The console APIs' gate: a valid, unexpired `erp_session` cookie.
-/// Replaces the retired `X-Admin-Key` header check.
+/// The console APIs' gate: a valid, unexpired `erp_session` cookie whose
+/// open_id is still allowlisted. Replaces the retired `X-Admin-Key`
+/// header check.
 pub fn session_ok(req: &Request, env: &Env) -> bool {
     session_claims(req, env).is_some()
 }
@@ -281,7 +310,23 @@ fn session_claims(req: &Request, env: &Env) -> Option<relay_core::erp::SessionCl
         .map(|s| s.to_string())?;
     let cookie = req.headers().get("Cookie").ok().flatten()?;
     let value = cookie_get(&cookie, SESSION_COOKIE)?;
-    read_session(&session_key(&app_secret), &value, now_secs())
+    read_console_session(
+        &session_key(&app_secret),
+        &value,
+        now_secs(),
+        &allowlist(env),
+    )
+}
+
+/// `ERP_ALLOWED_OPEN_IDS` ∪ `FEEDBACK_ADMIN_OPEN_ID`. `env.var` reads a
+/// plaintext var or a `wrangler secret` alike; secrets are the
+/// recommended home since `wrangler deploy` drops dashboard-set vars.
+fn allowlist(env: &Env) -> ConsoleAllowlist {
+    let get = |name: &str| env.var(name).ok().map(|v| v.to_string());
+    ConsoleAllowlist::from_config(
+        get("ERP_ALLOWED_OPEN_IDS").as_deref(),
+        get("FEEDBACK_ADMIN_OPEN_ID").as_deref(),
+    )
 }
 
 /// Re-read the profile from the contact API with the tenant token.
