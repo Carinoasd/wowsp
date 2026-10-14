@@ -158,9 +158,31 @@ fn signing_key(secret: &str) -> SigningKey {
     SigningKey::from_bytes(&expand_seed(secret))
 }
 
+/// op 13 `plain_token` 的长度上限（官方示例 20 位英数字，留足余量）。
+pub const PLAIN_TOKEN_MAX: usize = 64;
+/// op 13 `event_ts` 的长度上限（秒级 10 位，容忍毫秒级 13 位）。
+pub const EVENT_TS_MAX: usize = 13;
+
+/// op 13 字段的格式闸门。op 13 由未签名请求触发，而它签的
+/// `event_ts + plain_token` 与事件验签的 `timestamp + body` 是同一把
+/// 密钥、同一种拼接——字段不设限，任何人都能让它替一段伪造的事件
+/// JSON 签名，再拿去通过 [`verify_event_signature`]。限定为纯数字 +
+/// 英数字后，签名覆盖的整串只含 `[0-9A-Za-z]`、不含 `{`：无论
+/// timestamp 与 body 怎么切分，能验开的 body 都不是 JSON 对象。
+pub fn validation_fields_ok(plain_token: &str, event_ts: &str) -> bool {
+    (1..=PLAIN_TOKEN_MAX).contains(&plain_token.len())
+        && plain_token.bytes().all(|b| b.is_ascii_alphanumeric())
+        && (1..=EVENT_TS_MAX).contains(&event_ts.len())
+        && event_ts.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// 回调 URL 配置校验（op 13）：对 `event_ts + plain_token` 用 Secret 派生
-/// 的 Ed25519 私钥签名，回 op 14。
+/// 的 Ed25519 私钥签名，回 op 14。字段格式不合 [`validation_fields_ok`]
+/// 时返回 `None`（不签名）。
 pub fn validation_response(secret: &str, plain_token: &str, event_ts: &str) -> Option<Value> {
+    if !validation_fields_ok(plain_token, event_ts) {
+        return None;
+    }
     let msg = format!("{event_ts}{plain_token}");
     let sig = signing_key(secret).sign(msg.as_bytes());
     // 官方示例的应答体是扁平的两字段（无 op/d 信封）——平台按此解析。
@@ -381,12 +403,21 @@ mod tests {
     fn validation_signature_matches_official_recipe() {
         // 官方 Go 示例：seed = secret 翻倍到 32 字节；msg = event_ts + plain_token。
         let secret = "DG5g3B4j9X2KOErG"; // wiki 示例用的 16 字节短 secret
-        let resp = validation_response(secret, "plain-abc", "1690000000").unwrap();
-        assert_eq!(resp["plain_token"], "plain-abc");
+        // wiki event-emit.html 的官方示例：同一组输入应得出逐字相同的签名
+        // （Ed25519 是确定性签名）。
+        let official = validation_response(secret, "Arq0D5A61EgUu4OxUvOp", "1725442341").unwrap();
+        assert_eq!(official["plain_token"], "Arq0D5A61EgUu4OxUvOp");
+        assert_eq!(
+            official["signature"],
+            "87befc99c42c651b3aac0278e71ada338433ae26fcb24307bdc5ad38c1adc2d0\
+             1bcfcadc0842edac85e85205028a1132afe09280305f13aa6909ffc2d652c706"
+        );
+        let resp = validation_response(secret, "plainabc", "1690000000").unwrap();
+        assert_eq!(resp["plain_token"], "plainabc");
         let sig = resp["signature"].as_str().unwrap();
         // 用同一派生公钥能验开。
         let verifying = signing_key(secret).verifying_key();
-        let msg = b"1690000000plain-abc";
+        let msg = b"1690000000plainabc";
         assert!(
             verifying
                 .verify(msg, &Signature::from_slice(&unhex(sig).unwrap()).unwrap())
@@ -399,6 +430,69 @@ mod tests {
                 .verify(msg, &Signature::from_slice(&unhex(sig).unwrap()).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn validation_rejects_malformed_fields() {
+        let secret = "DG5g3B4j9X2KOErG";
+        let token = "Arq0D5A61EgUu4OxUvOp";
+        let ts = "1725442341";
+        assert!(validation_fields_ok(token, ts));
+        // 上限本身可用，越界即拒（含毫秒级 13 位时间戳）。
+        assert!(validation_fields_ok(&"a".repeat(PLAIN_TOKEN_MAX), ts));
+        assert!(validation_fields_ok(token, "1725442341000"));
+        for (bad_token, bad_ts) in [
+            ("", ts),
+            (&*"a".repeat(PLAIN_TOKEN_MAX + 1), ts),
+            ("plain-abc", ts),
+            ("plain abc", ts),
+            ("{\"op\":0}", ts),
+            ("令牌", ts),
+            (token, ""),
+            (token, "17254423410000"),
+            (token, "1725442341a"),
+            (token, "-1725442341"),
+            (token, " 1725442341"),
+            (token, "1.7e9"),
+        ] {
+            assert!(
+                !validation_fields_ok(bad_token, bad_ts),
+                "{bad_token:?} / {bad_ts:?} must be rejected"
+            );
+            assert_eq!(validation_response(secret, bad_token, bad_ts), None);
+        }
+    }
+
+    #[test]
+    fn validation_cannot_sign_a_forged_event() {
+        // 攻击路径：把整段伪造事件 JSON 塞进 op 13 的 plain_token 换签名，
+        // 再以 `X-Signature-Timestamp: event_ts` + 该 JSON 作为 body 通过
+        // 事件验签。修复后 op 13 拒绝签名。
+        let secret = "mptx-test-secret-0123456789";
+        let ts = "1700000000";
+        let forged = r#"{"op":0,"d":{"t":"C2C_MESSAGE_CREATE","d":{"id":"m","author":{"id":"EVIL"},"content":"绑定 10001"}}}"#;
+        assert!(matches!(
+            parse_callback(&serde_json::from_str(forged).unwrap()),
+            CallbackEvent::C2cMessage { .. }
+        ));
+        assert_eq!(validation_response(secret, forged, ts), None);
+
+        // 合法 op 13 拿到的签名覆盖的整串只含英数字：无论 timestamp 与
+        // body 怎么切分，能验开的 body 都不是 JSON 对象，落不进任何事件。
+        let token = "Arq0D5A61EgUu4OxUvOp";
+        let sig = validation_response(secret, token, ts).unwrap()["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let signed = format!("{ts}{token}");
+        for split in 0..=signed.len() {
+            let (head, body) = signed.split_at(split);
+            assert!(verify_event_signature(secret, head, body.as_bytes(), &sig));
+            let event = serde_json::from_str::<Value>(body)
+                .map(|v| parse_callback(&v))
+                .unwrap_or(CallbackEvent::Other);
+            assert_eq!(event, CallbackEvent::Other, "split at {split}");
+        }
     }
 
     #[test]

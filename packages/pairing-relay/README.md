@@ -144,8 +144,10 @@ old clients cannot talk to lands).
 
 1. 用户在通知群里 @机器人 或私聊发送「绑定 12345678」（旧口令
    「验证」同样接受）。回调 `POST /api/qqbot/callback`（Ed25519 验签，
-   URL 配置走 op 13/14）把该号码与 member/group openid（群内）或
-   c2c openid（私聊）合并进绑定记录（KV `qqbind:*`，长期）。
+   URL 配置走 op 13/14；op 13 只为纯数字 `event_ts` + 英数字
+   `plain_token` 签名，防止被当成事件签名工具）把该号码与
+   member/group openid（群内）或 c2c openid（私聊）合并进绑定记录
+   （KV `qqbind:*`，长期）。
 2. 回访：受理成功 → C2C 私聊（自限额 3 条/人/月，留平台配额余量）；
    `/erp` 状态改到「已开PR」→ 群内 markdown `<@member_openid>` 单独
    @（群主动消息配额珍贵，只留给这个场景）。全部尽力而为，失败静默。
@@ -182,12 +184,11 @@ and `/erp` are answered by this worker itself — they sit in
   link adds `focus=history`); the form itself mints a localStorage
   anonymous id and remembers the contact, server and game-ID fields.
 - **`POST /api/feedback/submit`** (multipart, multi-file) — normalize →
-  Turnstile siteverify (`channel=desktop` skips it — the widget is
-  domain-locked to the web page and cannot render inside the Tauri
-  webview; the KV limits below still apply) → KV rate limits (5/h per IP,
-  10/day per anonymous id, 300/day global) → a record in the
-  飞书多维表「WoWSP 反馈」(created/bootstrapped on
-  first use; see below) → optional log-bundle upload via
+  Turnstile siteverify (every channel — `channel` is client-supplied, and
+  desktop users submit through this same form in their browser) → KV
+  rate limits (5/h per IP, 10/day per anonymous id, 300/day global) → a
+  record in the 飞书多维表「WoWSP 反馈」(created/bootstrapped on first
+  use; see below) → optional log-bundle upload via
   `drive/v1/medias/upload_all` attached to the record's 日志包 field.
 - **`GET /erp`** — the maintainer's review console (Feishu-OAuth
   gated): lists records, flips 处理状态, writes PR links, downloads

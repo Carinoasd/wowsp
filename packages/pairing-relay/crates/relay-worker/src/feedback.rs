@@ -152,12 +152,10 @@ pub async fn handle_submit(mut req: Request, env: Env) -> Result<Response> {
     let bypassed = bypass_secret
         .as_deref()
         .is_some_and(|b| !b.is_empty() && ct_eq(&bypass, b));
-    // Desktop submissions come from the app itself: the Turnstile widget
-    // is domain-locked to the web form and cannot render inside the
-    // Tauri webview. The IP/anon/contact/global KV limits below still
-    // apply.
-    let desktop = sub.channel == "desktop";
-    if !bypassed && !desktop {
+    // Every channel passes Turnstile: `channel` is client-supplied, and the
+    // desktop app hands off to this same web form in the system browser
+    // (`?channel=desktop` prefill), where the widget renders normally.
+    if !bypassed {
         let Some(secret) = env.secret("TURNSTILE_SECRET").ok().map(|s| s.to_string()) else {
             return err(503, "maintenance");
         };

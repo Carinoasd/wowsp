@@ -138,6 +138,9 @@ pub async fn handle_callback(mut req: Request, env: &Env) -> Result<Response> {
         Err(_) => return Response::error("bad json", 400),
     };
     match qqbot::parse_callback(&v) {
+        // op 13 不验签（官方示例请求只带 User-Agent / X-Bot-Appid）；
+        // validation_response 的字段格式闸门保证它签不出可通过事件验签
+        // 的 JSON 事件体。
         CallbackEvent::Validation {
             plain_token,
             event_ts,
