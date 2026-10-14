@@ -49,7 +49,7 @@ struct CatalogueFile {
 
 /// One catalogue row. `purpose` is an i18n key suffix under
 /// `upstream.purpose.*`; `kind` splits the recorded stats family from
-/// the content family (updates/avatars/images/relay).
+/// the content family (updates/avatars/images/relay/telemetry).
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogueEntry {
@@ -320,6 +320,21 @@ mod tests {
         hosts.sort();
         let dupes = hosts.windows(2).filter(|w| w[0] == w[1]).count();
         assert!(dupes <= 1, "unexpected duplicate hosts beyond asia");
+    }
+
+    #[test]
+    fn catalogue_discloses_the_telemetry_hosts() {
+        // The webui's opt-out GA telemetry dials these (see the CSP in
+        // tauri.conf.json) — the "every external host" claim must hold.
+        let catalogue = host_catalogue();
+        for host in ["www.googletagmanager.com", "*.google-analytics.com"] {
+            let row = catalogue
+                .iter()
+                .find(|e| e.host == host)
+                .unwrap_or_else(|| panic!("{host} missing from the catalogue"));
+            assert_eq!(row.kind, "content", "{host} is never health-recorded");
+            assert_eq!(row.purpose, "analytics");
+        }
     }
 
     #[test]

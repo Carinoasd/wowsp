@@ -25,6 +25,7 @@
     "avatar": "サポーターアバター",
     "avatarCdn": "アバター CDN",
     "shipImages": "艦艇画像",
-    "relay": "ペアリング中継"
+    "relay": "ペアリング中継",
+    "analytics": "使用状況テレメトリー（Google Analytics）"
   }
 }

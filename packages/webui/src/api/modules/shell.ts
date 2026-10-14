@@ -177,11 +177,12 @@ export const shellApi = {
   logsOverview: () => transport.invoke<LogsOverview>(RPC.logs_overview),
   logsRevealLatest: () => transport.invoke<null>(RPC.logs_reveal_latest),
   /** Last `lines` lines (default 120) of the newest log, UTF-8 text for
-   *  clipboard sharing. */
+   *  clipboard sharing (redacted backend-side, like the bundle). */
   logsReadTail: (lines?: number) =>
     transport.invoke<string>(RPC.logs_read_tail, { lines: lines ?? null }),
-  /** Write the feedback zip bundle (logs + UTF-8 manifest) into the logs
-   *  folder, reveal it in the file manager, and return its path.
+  /** Write the feedback zip bundle (logs + UTF-8 manifest, redacted on
+   *  export — the files on disk stay raw) into the logs folder, reveal it
+   *  in the file manager, and return its path.
    *  `includeHardware` (only ever set after the consent dialog) also sweeps
    *  the machine's hardware/environment report into the bundle and may
    *  raise a UAC prompt via the app's elevated helper relaunch. */

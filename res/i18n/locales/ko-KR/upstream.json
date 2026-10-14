@@ -25,6 +25,7 @@
     "avatar": "서포터 아바타",
     "avatarCdn": "아바타 CDN",
     "shipImages": "함선 이미지",
-    "relay": "페어링 릴레이"
+    "relay": "페어링 릴레이",
+    "analytics": "사용량 원격 측정 (Google Analytics)"
   }
 }

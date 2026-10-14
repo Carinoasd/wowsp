@@ -25,6 +25,7 @@
     "avatar": "Avatars des supporters",
     "avatarCdn": "CDN d'avatars",
     "shipImages": "Images de navires",
-    "relay": "Relais d'appairage"
+    "relay": "Relais d'appairage",
+    "analytics": "Télémétrie d'utilisation (Google Analytics)"
   }
 }

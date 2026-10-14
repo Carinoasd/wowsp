@@ -21,6 +21,8 @@
     { "id": "bilibili-api", "host": "api.bilibili.com", "purpose": "avatar", "realms": [], "kind": "content" },
     { "id": "bilibili-cdn", "host": "*.hdslb.com", "purpose": "avatarCdn", "realms": [], "kind": "content" },
     { "id": "wg-cdn", "host": "*.wgcdn.co", "purpose": "shipImages", "realms": [], "kind": "content" },
-    { "id": "pairing-relay", "host": "wowsp.langyo.xyz", "purpose": "relay", "realms": [], "kind": "content" }
+    { "id": "pairing-relay", "host": "wowsp.langyo.xyz", "purpose": "relay", "realms": [], "kind": "content" },
+    { "id": "ga-tag", "host": "www.googletagmanager.com", "purpose": "analytics", "realms": [], "kind": "content" },
+    { "id": "ga-collect", "host": "*.google-analytics.com", "purpose": "analytics", "realms": [], "kind": "content" }
   ]
 }
