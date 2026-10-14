@@ -210,6 +210,50 @@ pub fn frame_verdict(size: usize) -> FrameVerdict {
     }
 }
 
+/// Handshake state of ONE host control socket. A socket says `hello`
+/// at most once, so the identity its allocations are keyed by is fixed
+/// for the socket's life — re-sending `hello` with a fresh hostId to
+/// mint code after code is refused (the worker closes the socket).
+#[derive(Debug, Default)]
+pub struct HostControl {
+    greeted: bool,
+    host_id: Option<String>,
+}
+
+/// What to do with a host's `hello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloVerdict {
+    /// First hello: answer `welcome`.
+    Welcome,
+    /// This socket already said hello: refuse (close the socket).
+    Duplicate,
+}
+
+impl HostControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A `hello` arrived. Only the first one counts; a malformed hostId
+    /// is still a hello (v1 parity: welcomed, allocations fall back to
+    /// the room key).
+    pub fn hello(&mut self, host_id: &str) -> HelloVerdict {
+        if self.greeted {
+            return HelloVerdict::Duplicate;
+        }
+        self.greeted = true;
+        if crate::valid_host_id(host_id) {
+            self.host_id = Some(host_id.to_string());
+        }
+        HelloVerdict::Welcome
+    }
+
+    /// The hostId this socket's allocations are keyed by, if any.
+    pub fn host_id(&self) -> Option<&str> {
+        self.host_id.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +394,27 @@ mod tests {
         assert_eq!(Side::parse(Some("sidekick")), None);
         assert_eq!(Side::Host.as_str(), "host");
         assert_eq!(Side::Client.as_str(), "client");
+    }
+
+    #[test]
+    fn host_socket_accepts_exactly_one_hello() {
+        let mut ctl = HostControl::new();
+        assert_eq!(ctl.host_id(), None, "v1 hosts never say hello");
+        assert_eq!(ctl.hello("deadbeef00112233"), HelloVerdict::Welcome);
+        assert_eq!(ctl.host_id(), Some("deadbeef00112233"));
+        // A second hello — fresh hostId or the same one — is refused
+        // and does not change the socket's identity.
+        assert_eq!(ctl.hello("deadbeef00112244"), HelloVerdict::Duplicate);
+        assert_eq!(ctl.hello("deadbeef00112233"), HelloVerdict::Duplicate);
+        assert_eq!(ctl.host_id(), Some("deadbeef00112233"));
+    }
+
+    #[test]
+    fn malformed_host_id_still_spends_the_one_hello() {
+        let mut ctl = HostControl::new();
+        assert_eq!(ctl.hello("NOT-HEX"), HelloVerdict::Welcome);
+        assert_eq!(ctl.host_id(), None);
+        assert_eq!(ctl.hello("deadbeef00112233"), HelloVerdict::Duplicate);
+        assert_eq!(ctl.host_id(), None);
     }
 }
