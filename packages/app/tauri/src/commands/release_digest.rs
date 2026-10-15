@@ -1,29 +1,37 @@
-//! Official sha256 digests of this repository's GitHub release assets.
+//! Official sha256 digests of this repository's release assets.
 //!
 //! Every release asset the app consumes — the updater's installer, the
 //! Mod Hub index, the resource pack and its chain patches, the data pack —
 //! may stream through third-party mirrors (see [`super::github_mirror`]).
 //! A mirror able to serve both a payload and the hash published next to it
-//! could forge both, so the trust anchor is the `digest` GitHub itself
-//! computes for every release asset, read straight from `api.github.com`
-//! and never through a mirror prefix. A digest that WAS obtained is always
-//! binding, and an asset without one is an `Err`. Whether an unreachable
-//! API (transport failure, 5xx, 403/429 rate limiting) also blocks is the
-//! caller's choice: [`fetch_official_sha256`] fails closed (Mod Hub — its
-//! payloads execute, like the updater's), [`lookup_official_sha256`] reports
-//! [`OfficialDigest::Unavailable`] so content-only channels (resource and
-//! data packs) can keep their mirror-manifest path.
+//! could forge both, so the trust anchors are two channels the payload
+//! mirrors can influence neither:
 //!
-//! `update.rs` still carries its own copy of the installer digest lookup
-//! (`fetch_official_sha256` / `asset_sha256`, from #889) because #1067
-//! reworks that code in parallel. Once both have merged, the updater
-//! should switch to this module and the duplicate should be removed.
+//! 1. the `digest` GitHub itself computes for every release asset, read
+//!    straight from `api.github.com` (never a mirror prefix), and
+//! 2. the pairing relay worker's signed digest docs
+//!    (`GET /api/digests/<channel>[/<tag>]`, see relay-core's `digests`
+//!    module and scripts/publish_digests.py) — reachable where
+//!    api.github.com is not, and pinned to compile-time Ed25519 keys so
+//!    neither the KV store nor the worker can forge one.
+//!
+//! Both legs run concurrently; a channel that answers alone decides, and
+//! two answering channels must agree (a disagreement is terminal). A
+//! digest that WAS obtained is always binding, and a channel that answers
+//! but cannot name the asset's digest is an `Err`. Whether NO reachable
+//! channel also blocks is the caller's choice: [`fetch_official_sha256`]
+//! fails closed (Mod Hub — its payloads execute, like the updater's),
+//! [`lookup_official_sha256`] reports [`OfficialDigest::Unavailable`] so
+//! content-only channels (resource and data packs) can keep their
+//! mirror-manifest path.
 //!
 //! The app's proxy settings still apply (the shared proxy-aware client);
-//! only the third-party mirror ladder is bypassed. Each API document's
-//! ETag is remembered for the process lifetime and revalidated with
-//! `If-None-Match` — a 304 does not count against the unauthenticated
-//! 60-requests-per-hour limit.
+//! only the third-party mirror ladder is bypassed. Each GitHub API
+//! document's ETag is remembered for the process lifetime and revalidated
+//! with `If-None-Match` — a 304 does not count against the unauthenticated
+//! 60-requests-per-hour limit. The updater's app-channel flow
+//! (`update.rs::official_release`) consumes this module's shared pieces
+//! (signature verification, seq ratchet, channel combiner).
 
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
@@ -49,6 +57,27 @@ const API_ATTEMPTS: u32 = 3;
 
 /// Back-off before retry `n` (`n × RETRY_DELAY`).
 const RETRY_DELAY: Duration = Duration::from_millis(750);
+
+/// Per-attempt cap and attempts for a relay digest fetch — the fast path
+/// gets two short tries before the GitHub budget takes over.
+const RELAY_DIGEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_DIGEST_ATTEMPTS: u32 = 2;
+
+/// The GitHub cross-check leg runs as ONE attempt with the relay's short
+/// cap, so a blackholed api.github.com costs at most one timeout — paid in
+/// parallel with the relay leg, never serialized.
+const QUICK_API_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The channels the relay's digest endpoint serves. This mirrors
+/// relay-core's `DIGEST_CHANNELS` — that crate belongs to the worker and
+/// is not a dependency of the app, so the set is restated here and must
+/// not drift (publish_digests.py pushes exactly these).
+pub const DIGEST_CHANNELS: [&str; 4] = ["app", "mod-hub", "res", "data"];
+
+/// A channel name the relay endpoint would serve.
+fn valid_channel(channel: &str) -> bool {
+    DIGEST_CHANNELS.contains(&channel)
+}
 
 /// The official release API for one tag. Deliberately NOT routed through
 /// `github_mirror`.
@@ -153,10 +182,18 @@ fn status_verdict(status: reqwest::StatusCode) -> StatusVerdict {
 static ETAG_CACHE: LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
     LazyLock::new(Default::default);
 
-/// GET one official API document. Transport failures, unparsable bodies
-/// and 5xx are retried with a short back-off; 403/429 end the lookup as
-/// [`ApiLookup::Unavailable`] at once; any other status is an `Err`.
-pub async fn lookup_api_json(client: &reqwest::Client, url: &str) -> Result<ApiLookup> {
+/// One conditional GET of an official API document through the ETag cache.
+/// The caller owns the retry budget: `Retryable` covers transport
+/// failures, unparsable bodies, 5xx and a 304 without a cached copy,
+/// `Unavailable` the rate-limit statuses, and definitive statuses (404 …)
+/// are an `Err`.
+enum ApiAttempt {
+    Found(serde_json::Value),
+    Unavailable(String),
+    Retryable(String),
+}
+
+async fn api_attempt(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<ApiAttempt> {
     debug_assert!(
         url.starts_with(API_REPO),
         "official lookups must target {API_REPO}, got {url}"
@@ -165,100 +202,554 @@ pub async fn lookup_api_json(client: &reqwest::Client, url: &str) -> Result<ApiL
         .lock()
         .ok()
         .and_then(|cache| cache.get(url).cloned());
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("WoWSP/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .timeout(timeout);
+    if let Some((etag, _)) = &cached {
+        request = request.header("If-None-Match", etag.as_str());
+    }
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return Ok(ApiAttempt::Retryable(format!("{url}: {e}"))),
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if let Some((_, doc)) = &cached {
+            return Ok(ApiAttempt::Found(doc.clone()));
+        }
+        return Ok(ApiAttempt::Retryable(format!(
+            "{url}: HTTP 304 without a cached copy"
+        )));
+    }
+    if !status.is_success() {
+        return match status_verdict(status) {
+            StatusVerdict::Retry => Ok(ApiAttempt::Retryable(format!("{url}: HTTP {status}"))),
+            StatusVerdict::Unavailable => {
+                Ok(ApiAttempt::Unavailable(format!("{url}: HTTP {status}")))
+            },
+            StatusVerdict::Fatal => bail!("{url}: HTTP {status}"),
+        };
+    }
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match response.json::<serde_json::Value>().await {
+        Ok(doc) => {
+            if let (Some(etag), Ok(mut cache)) = (etag, ETAG_CACHE.lock()) {
+                cache.insert(url.to_string(), (etag, doc.clone()));
+            }
+            Ok(ApiAttempt::Found(doc))
+        },
+        Err(e) => Ok(ApiAttempt::Retryable(format!("parse {url}: {e}"))),
+    }
+}
+
+/// GET one official API document. Transport failures, unparsable bodies
+/// and 5xx are retried with a short back-off; 403/429 end the lookup as
+/// [`ApiLookup::Unavailable`] at once; any other status is an `Err`.
+pub async fn lookup_api_json(client: &reqwest::Client, url: &str) -> Result<ApiLookup> {
     let mut last_err = String::new();
     for attempt in 0..API_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(RETRY_DELAY * attempt).await;
         }
-        let mut request = client
-            .get(url)
-            .header("User-Agent", concat!("WoWSP/", env!("CARGO_PKG_VERSION")))
-            .header("Accept", "application/vnd.github+json")
-            .timeout(API_TIMEOUT);
-        if let Some((etag, _)) = &cached {
-            request = request.header("If-None-Match", etag.as_str());
-        }
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("{url}: {e}");
-                continue;
-            },
-        };
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some((_, doc)) = &cached {
-                return Ok(ApiLookup::Found(doc.clone()));
-            }
-            last_err = format!("{url}: HTTP 304 without a cached copy");
-            continue;
-        }
-        if !status.is_success() {
-            match status_verdict(status) {
-                StatusVerdict::Retry => {
-                    last_err = format!("{url}: HTTP {status}");
-                    continue;
-                },
-                StatusVerdict::Unavailable => {
-                    return Ok(ApiLookup::Unavailable(format!("{url}: HTTP {status}")));
-                },
-                StatusVerdict::Fatal => bail!("{url}: HTTP {status}"),
-            }
-        }
-        let etag = response
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        match response.json::<serde_json::Value>().await {
-            Ok(doc) => {
-                if let (Some(etag), Ok(mut cache)) = (etag, ETAG_CACHE.lock()) {
-                    cache.insert(url.to_string(), (etag, doc.clone()));
-                }
-                return Ok(ApiLookup::Found(doc));
-            },
-            Err(e) => last_err = format!("parse {url}: {e}"),
+        match api_attempt(client, url, API_TIMEOUT).await? {
+            ApiAttempt::Found(doc) => return Ok(ApiLookup::Found(doc)),
+            ApiAttempt::Unavailable(e) => return Ok(ApiLookup::Unavailable(e)),
+            ApiAttempt::Retryable(e) => last_err = e,
         }
     }
     Ok(ApiLookup::Unavailable(last_err))
 }
 
-/// The official digest of one release asset, or why the API could not
-/// supply it right now.
+/// One short GitHub attempt for the dual-channel cross-check: no retry
+/// budget, so the blocked-GitHub path costs a single timeout, paid in
+/// parallel with the relay leg. Transient shapes read as "GitHub silent
+/// right now"; definitive errors are an `Err`.
+async fn github_doc_quick(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
+    match api_attempt(client, url, QUICK_API_TIMEOUT).await? {
+        ApiAttempt::Found(doc) => Ok(doc),
+        ApiAttempt::Retryable(e) | ApiAttempt::Unavailable(e) => Err(anyhow!(e)),
+    }
+}
+
+// ── The pairing relay's signed digest docs ──────────────────────────────
+
+/// Compile-time pinned Ed25519 public keys (standard base64 of the 32
+/// raw bytes) that relay digest docs may be signed with. The private
+/// seeds NEVER enter this repository (AGENTS.md §7) — see the ceremony
+/// in scripts/catalog_signing.py and res/keys/README.md (seeds live at
+/// ~/.wowsp-signing/ on the maintainer's machine; the WOWSP_DIGEST_
+/// SIGNING_KEY repo secret carries the `main` seed for release.yml).
+///
+/// With keys pinned, a valid signature by a listed key is REQUIRED —
+/// the KV store and the worker itself can no longer forge a doc, and a
+/// replayed old signed doc is all that remains (which the seq ratchet
+/// refuses). `backup` is pinned for rotation: publishes sign with
+/// `main` and may switch to `backup` with no app release in between.
+pub const PINNED_DIGEST_KEYS: &[(&str, &str)] = &[
+    ("main", include_str!("../../res/keys/digest-main.pub")),
+    ("backup", include_str!("../../res/keys/digest-backup.pub")),
+];
+
+/// Verify the doc's optional Ed25519 signature layer against `keys`.
+/// The signed bytes are the doc's JSON without the `sig` member,
+/// rendered with sorted keys and compact separators — byte-identical
+/// to scripts/catalog_signing.py's canonical form (serde_json's Map is
+/// sorted; every doc member that reaches the canonical form is ASCII).
+/// This relies on serde_json's DEFAULT sorted-key Map: enabling the
+/// `preserve_order` feature anywhere in the crate graph would reorder
+/// the canonical bytes and break verification — the cross-language
+/// fixture test is the canary that catches exactly that.
+pub fn verify_doc_signature(doc: &serde_json::Value, keys: &[(&str, &str)]) -> Result<()> {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let key_id = doc.get("key_id").and_then(|v| v.as_str());
+    let sig_b64 = doc.get("sig").and_then(|v| v.as_str());
+    match (key_id, sig_b64) {
+        (None, None) => {
+            if keys.is_empty() {
+                return Ok(());
+            }
+            bail!("the relay digest doc is unsigned but the app pins signing keys");
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("the relay digest doc is half-signed (key_id/sig must appear together)");
+        },
+        (Some(key_id), Some(sig_b64)) => {
+            let pub_b64 = keys
+                .iter()
+                .find(|(id, _)| *id == key_id)
+                .map(|(_, key)| *key)
+                .ok_or_else(|| {
+                    anyhow!("the relay digest doc is signed by unknown key {key_id:?}")
+                })?;
+            let key_bytes = base64::engine::general_purpose::STANDARD
+                .decode(pub_b64.trim())
+                .map_err(|e| anyhow!("pinned key {key_id:?} is not valid base64: {e}"))?;
+            let key_bytes: [u8; 32] = key_bytes
+                .try_into()
+                .map_err(|_| anyhow!("pinned key {key_id:?} is not 32 bytes"))?;
+            let sig_bytes = base64::engine::general_purpose::STANDARD
+                .decode(sig_b64)
+                .map_err(|e| anyhow!("the relay digest signature is not valid base64: {e}"))?;
+            let signature = Signature::from_slice(&sig_bytes)
+                .map_err(|e| anyhow!("the relay digest signature is malformed: {e}"))?;
+            let key = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|e| anyhow!("pinned key {key_id:?} is malformed: {e}"))?;
+
+            let mut unsigned = doc.clone();
+            unsigned
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("the relay digest doc is not a JSON object"))?
+                .remove("sig");
+            let canonical = serde_json::to_vec(&unsigned)
+                .map_err(|e| anyhow!("canonicalizing the relay digest doc: {e}"))?;
+            key.verify(&canonical, &signature)
+                .map_err(|e| anyhow!("the relay digest signature does not verify: {e}"))?;
+            Ok(())
+        },
+    }
+}
+
+/// A parsed, signature-verified relay digest document (relay-core's
+/// `DigestDoc`): the published release tag, the doc's `{asset -> sha256}`
+/// table, and the per-channel publish counter (the rollback guard's
+/// input).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayDigestDoc {
+    /// The release tag this doc was published for.
+    pub tag: String,
+    /// The doc's asset table, values as published (bare hex expected;
+    /// validated per lookup by [`RelayDigestDoc::asset`]).
+    pub assets: HashMap<String, String>,
+    /// Per-channel, strictly increasing across publishes.
+    pub seq: u64,
+}
+
+impl RelayDigestDoc {
+    /// The doc's sha256 for `name`: present, well-formed, lowercase.
+    pub fn asset(&self, name: &str) -> Result<String> {
+        let hex = self.assets.get(name).ok_or_else(|| {
+            anyhow!(
+                "relay digest carries no sha256 for {name} (tag {})",
+                self.tag
+            )
+        })?;
+        if !is_sha256_hex(hex) {
+            bail!(
+                "the relay digest for {name} (tag {}) is not a well-formed sha256",
+                self.tag
+            );
+        }
+        Ok(hex.to_ascii_lowercase())
+    }
+}
+
+/// Parse and verify one relay digest doc for `channel` against `keys`
+/// (tests pass their own; production passes [`PINNED_DIGEST_KEYS`]).
+/// Field errors and signature failures are both `Err` — a doc that does
+/// not check out is never partially trusted.
+pub fn parse_relay_digest_with(
+    doc: &serde_json::Value,
+    keys: &[(&str, &str)],
+    channel: &str,
+) -> Result<RelayDigestDoc> {
+    if doc["channel"].as_str() != Some(channel) {
+        bail!("the relay digest doc is not the {channel} channel");
+    }
+    verify_doc_signature(doc, keys)?;
+    let tag = doc["tag"]
+        .as_str()
+        .ok_or_else(|| anyhow!("the relay digest doc carries no tag"))?;
+    if !is_plain_segment(tag) {
+        bail!("the relay digest tag {tag:?} is not a plain release tag");
+    }
+    let assets = doc["assets"]
+        .as_object()
+        .ok_or_else(|| anyhow!("the relay digest doc carries no asset table"))?
+        .iter()
+        // Non-string entries parse as empty and fail the hex check at
+        // lookup time — the same refusal, without a second pass here.
+        .map(|(name, sha)| (name.clone(), sha.as_str().unwrap_or_default().to_string()))
+        .collect::<HashMap<_, _>>();
+    let seq = doc["seq"]
+        .as_u64()
+        .filter(|seq| *seq >= 1)
+        .ok_or_else(|| anyhow!("the relay digest doc carries no publish sequence number"))?;
+    Ok(RelayDigestDoc {
+        tag: tag.to_string(),
+        assets,
+        seq,
+    })
+}
+
+/// The relay worker's digest endpoint for one channel — the rolling
+/// latest pointer, or the doc pinned to `tag`. Root resolution rides the
+/// pairing module's helper so the undocumented `WOWSP_RELAY_URL` dev
+/// override (trim, scheme mapping, fallback) behaves exactly as it does
+/// for pairing.
+pub fn relay_digest_url(channel: &str, tag: Option<&str>) -> String {
+    let root = super::pairing_relay::builtin_relay_root();
+    match tag {
+        Some(tag) => format!("{root}/api/digests/{channel}/{tag}"),
+        None => format!("{root}/api/digests/{channel}"),
+    }
+}
+
+/// Fetch and verify the relay doc at `url`. Two short attempts; any
+/// failure is an `Err` the dual-channel lookup turns into "the GitHub
+/// leg decides" (a doc that does not verify never yields content).
+async fn fetch_relay_doc_at(
+    client: &reqwest::Client,
+    url: &str,
+    channel: &str,
+) -> Result<RelayDigestDoc> {
+    debug_assert!(
+        valid_channel(channel),
+        "the relay digest endpoint serves {DIGEST_CHANNELS:?}, got {channel}"
+    );
+    let mut last_err = String::new();
+    for _ in 0..RELAY_DIGEST_ATTEMPTS {
+        let response = client
+            .get(url)
+            .header("User-Agent", concat!("WoWSP/", env!("CARGO_PKG_VERSION")))
+            .timeout(RELAY_DIGEST_TIMEOUT)
+            .send()
+            .await;
+        let doc: serde_json::Value = match response {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = format!("parse {url}: {e}");
+                    continue;
+                },
+            },
+            Ok(r) => {
+                last_err = format!("{url}: HTTP {}", r.status());
+                continue;
+            },
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                continue;
+            },
+        };
+        return parse_relay_digest_with(&doc, PINNED_DIGEST_KEYS, channel);
+    }
+    bail!("relay digest channel unavailable: {last_err}")
+}
+
+/// The channel's rolling latest-pointer doc. The caller learns the tag
+/// from the doc (the updater's app channel works this way). The
+/// per-tag pinned lookups (the resource pack's `res-delta-*` edges)
+/// go through [`relay_pinned_sha256`] instead, which owns its own
+/// reachability semantics.
+pub async fn fetch_relay_doc_latest(
+    client: &reqwest::Client,
+    channel: &str,
+) -> Result<RelayDigestDoc> {
+    fetch_relay_doc_at(client, &relay_digest_url(channel, None), channel).await
+}
+
+// ── The rollback ratchet (per channel) ─────────────────────────────────
+
+/// Persisted high-water mark of accepted relay digest docs, one per
+/// channel — the rollback guard relay-core's digests module documents.
+/// It only REFUSES in the case where the relay doc decides the digest
+/// (GitHub unreachable); when GitHub answered and agrees, a regressed
+/// seq is an ops artifact (a rebuilt KV namespace restarts the counter),
+/// not an attack, and the mark simply never lowers. Defense-in-depth,
+/// not tamper-proofing: without doc signatures a store-level attacker
+/// can raise seq arbitrarily.
+///
+/// The app channel keeps its already-deployed file name; the content
+/// channels added later are namespaced by channel.
+fn relay_seq_file(channel: &str) -> String {
+    if channel == "app" {
+        ".relay-digest-seq.json".to_string()
+    } else {
+        format!(".relay-digest-seq-{channel}.json")
+    }
+}
+
+/// The channel's accepted seq mark, when a readable one exists.
+pub async fn accepted_relay_seq(channel: &str) -> Option<u64> {
+    let dir = crate::paths::ensure_data_dir().ok()?;
+    tokio::fs::read_to_string(dir.join(relay_seq_file(channel)))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Best-effort, monotone, and torn-write safe (tmp + rename): a failed
+/// or skipped mark only weakens the NEXT rollback check.
+pub async fn remember_relay_seq(channel: &str, seq: u64) {
+    let Ok(dir) = crate::paths::ensure_data_dir() else {
+        return;
+    };
+    let name = relay_seq_file(channel);
+    let tmp = dir.join(format!("{name}.tmp"));
+    if tokio::fs::write(&tmp, seq.to_string()).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, dir.join(&name)).await;
+    }
+}
+
+/// Pure core of the rollback check: a doc may only advance the mark
+/// (an equal seq is a replay, a lower one a revert).
+pub fn ensure_seq_advances(prev: Option<u64>, next: u64) -> Result<()> {
+    if prev.is_some_and(|prev| next <= prev) {
+        bail!(
+            "the relay digest regressed (seq {next} at/below the accepted {prev:?}) — refusing the update"
+        );
+    }
+    Ok(())
+}
+
+/// Combine the two official channels. Both answering must mean the same
+/// value — a disagreement means one channel is lying, and the lookup is
+/// refused rather than guessed at (this also covers the seconds-wide
+/// publish race where the relay doc lags GitHub's retag: refusing until
+/// the relay catches up is the price of the cross-check). One channel
+/// answering is enough; neither answering leaves only the error to
+/// report. `render` names a value in the refusal message.
+pub fn choose_official<T: PartialEq>(
+    relay: Result<T>,
+    github: Result<T>,
+    render: impl Fn(&T) -> String,
+) -> Result<T> {
+    match (relay, github) {
+        (Ok(r), Err(_)) => Ok(r),
+        (Ok(r), Ok(g)) if r == g => Ok(r),
+        (Ok(r), Ok(g)) => bail!(
+            "the official digest channels disagree (relay says {}, GitHub says {}) — refusing to proceed",
+            render(&r),
+            render(&g)
+        ),
+        (Err(_), Ok(g)) => Ok(g),
+        (Err(relay_err), Err(_)) => Err(relay_err),
+    }
+}
+
+// ── The dual-channel lookups ───────────────────────────────────────────
+
+/// The relay leg's contribution to a lookup: the latest-pointer doc must
+/// name `tag` and carry the asset's digest. A doc naming another tag is
+/// stale (GitHub retags res-latest / data-latest / mod-hub in place, and
+/// the relay push lands after the GitHub upload), and a doc without an
+/// entry for the asset is an ops gap (an images-only publish must not
+/// break manifest verification) — both downgrade the leg to `Err` so
+/// the GitHub leg decides, never a fallback by themselves.
+fn relay_leg_sha(
+    channel: &str,
+    doc: RelayDigestDoc,
+    tag: &str,
+    name: &str,
+) -> Result<(RelayDigestDoc, String)> {
+    anyhow::ensure!(
+        doc.tag == tag,
+        "the relay {channel} doc names tag {:?}, the lookup wants {tag:?}",
+        doc.tag
+    );
+    let sha = doc.asset(name)?;
+    Ok((doc, sha))
+}
+
+/// The official digest of one release asset, or why no official channel
+/// could supply it right now.
 pub enum OfficialDigest {
-    /// GitHub's sha256 for the asset — binding on the caller.
+    /// The sha256 both-or-one official channel(s) named — binding on the
+    /// caller.
     Verified(String),
-    /// The API is unreachable or rate limited (see [`ApiLookup`]).
+    /// Both official channels are unreachable or rate limited (see
+    /// [`ApiLookup`]).
     Unavailable(String),
 }
 
-/// Look up the official sha256 of asset `name` on release `tag`. A release
-/// that answers but carries no digest for the asset is an `Err`, never
-/// [`OfficialDigest::Unavailable`].
+/// Look up the official sha256 of asset `name` on the channel's current
+/// release (`tag` is the release tag both channels must name — the
+/// relay's latest pointer and GitHub's `/releases/tags/<tag>` alike; a
+/// relay doc naming another tag is stale and the GitHub leg decides).
+/// The relay leg runs first-class with a single short GitHub
+/// cross-check; only when BOTH quick legs fail is GitHub's full retry
+/// budget spent before reporting [`OfficialDigest::Unavailable`]. A
+/// release that answers but carries no digest for the asset is an `Err`,
+/// never `Unavailable`.
 pub async fn lookup_official_sha256(
     client: &reqwest::Client,
+    channel: &str,
     tag: &str,
     name: &str,
 ) -> Result<OfficialDigest> {
-    match lookup_api_json(client, &release_api_url(tag)).await? {
-        ApiLookup::Found(release) => asset_sha256(&release, name)
-            .map(OfficialDigest::Verified)
-            .ok_or_else(|| anyhow!("release {tag} publishes no sha256 digest for {name}")),
-        ApiLookup::Unavailable(e) => Ok(OfficialDigest::Unavailable(e)),
+    let api_url = release_api_url(tag);
+    let (relay, github_quick) = tokio::join!(
+        fetch_relay_doc_latest(client, channel),
+        github_doc_quick(client, &api_url),
+    );
+    let relay = relay.and_then(|doc| relay_leg_sha(channel, doc, tag, name));
+    let github_digest = |release: serde_json::Value| {
+        asset_sha256(&release, name)
+            .ok_or_else(|| anyhow!("release {tag} publishes no sha256 digest for {name}"))
+    };
+    match (relay, github_quick) {
+        // Both quick legs unavailable (the common transient shape on CN
+        // networks): spend GitHub's full retry budget before reporting
+        // the digest unavailable.
+        (Err(relay_err), Err(_)) => match lookup_api_json(client, &api_url).await? {
+            ApiLookup::Found(release) => Ok(OfficialDigest::Verified(github_digest(release)?)),
+            ApiLookup::Unavailable(github_err) => Ok(OfficialDigest::Unavailable(format!(
+                "relay: {relay_err}; GitHub: {github_err}"
+            ))),
+        },
+        (Ok((doc, relay_sha)), github_quick) => {
+            let prev = accepted_relay_seq(channel).await;
+            let github_side = github_quick.and_then(github_digest);
+            // The rollback refusal guards exactly the case where the
+            // relay doc DECIDES the digest — GitHub silent, or GitHub
+            // answering without a digest for the asset (then the relay
+            // is the only voice). When GitHub named the same digest, a
+            // regressed seq is an ops artifact — agreement passes below,
+            // disagreement still refuses — and the monotone remember
+            // keeps the mark from ever lowering.
+            if github_side.is_err() {
+                ensure_seq_advances(prev, doc.seq)?;
+            }
+            let sha = choose_official(Ok(relay_sha), github_side, |sha| format!("{}…", &sha[..8]))?;
+            if doc.seq > prev.unwrap_or(0) {
+                remember_relay_seq(channel, doc.seq).await;
+            }
+            Ok(OfficialDigest::Verified(sha))
+        },
+        (Err(_), Ok(release)) => Ok(OfficialDigest::Verified(github_digest(release)?)),
     }
 }
 
-/// Fetch the official sha256 of asset `name` on release `tag`, failing
-/// closed: a payload that cannot be verified is never accepted.
+/// Fetch the official sha256 of asset `name` on the channel's current
+/// release, failing closed: a payload that cannot be verified is never
+/// accepted.
 pub async fn fetch_official_sha256(
     client: &reqwest::Client,
+    channel: &str,
     tag: &str,
     name: &str,
 ) -> Result<String> {
-    match lookup_official_sha256(client, tag, name).await? {
+    match lookup_official_sha256(client, channel, tag, name).await? {
         OfficialDigest::Verified(sha) => Ok(sha),
         OfficialDigest::Unavailable(e) => bail!("official digest unavailable: {e}"),
     }
+}
+
+/// Pure core of [`relay_pinned_sha256`] (tests pass their own key
+/// table; production passes [`PINNED_DIGEST_KEYS`]): a doc that answers
+/// must verify and name `tag` (anything else is a hard `Err`, never a
+/// silent downgrade); a missing or malformed asset entry is an ops gap,
+/// not an attack — `Ok(None)`, the caller keeps its other source (the
+/// tree-hash check still guards the patched result).
+fn pinned_sha_from_doc(
+    doc: &serde_json::Value,
+    keys: &[(&str, &str)],
+    channel: &str,
+    tag: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let doc = parse_relay_digest_with(doc, keys, channel)?;
+    anyhow::ensure!(
+        doc.tag == tag,
+        "the pinned relay doc for {tag} names tag {:?} instead",
+        doc.tag
+    );
+    Ok(doc.asset(name).ok())
+}
+
+/// The relay's pinned digest for one specific tag's asset (the resource
+/// pack's per-delta docs). `Ok(None)` when the relay cannot serve the
+/// doc right now — unreachable, unknown tag, or no entry for the asset —
+/// leaving the caller's other digest source in charge; a doc that DOES
+/// answer but fails its signature or names another tag is a hard `Err`,
+/// never silently downgraded.
+pub async fn relay_pinned_sha256(
+    client: &reqwest::Client,
+    channel: &str,
+    tag: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let url = relay_digest_url(channel, Some(tag));
+    let mut last_err = String::from("no relay attempt made");
+    for _ in 0..RELAY_DIGEST_ATTEMPTS {
+        let response = client
+            .get(&url)
+            .header("User-Agent", concat!("WoWSP/", env!("CARGO_PKG_VERSION")))
+            .timeout(RELAY_DIGEST_TIMEOUT)
+            .send()
+            .await;
+        let doc = match response {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = format!("parse {url}: {e}");
+                    continue;
+                },
+            },
+            Ok(r) => {
+                last_err = format!("{url}: HTTP {}", r.status());
+                continue;
+            },
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                continue;
+            },
+        };
+        let doc = pinned_sha_from_doc(&doc, PINNED_DIGEST_KEYS, channel, tag, name)?;
+        return Ok(doc);
+    }
+    tracing::warn!("relay digest lookup for {tag} unavailable: {last_err}");
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -395,5 +886,271 @@ mod tests {
             None,
             "non-hex"
         );
+    }
+
+    #[test]
+    fn relay_urls_ride_the_pairing_root() {
+        let latest = relay_digest_url("res", None);
+        assert!(latest.ends_with("/api/digests/res"), "{latest}");
+        let pinned = relay_digest_url(
+            "res",
+            Some(&format!("res-delta-{}-{}", "a".repeat(64), "b".repeat(64))),
+        );
+        assert!(
+            pinned.ends_with(&format!(
+                "/api/digests/res/res-delta-{}-{}",
+                "a".repeat(64),
+                "b".repeat(64)
+            )),
+            "{pinned}"
+        );
+        assert_ne!(latest, pinned);
+    }
+
+    #[test]
+    fn digest_channels_form_the_closed_set() {
+        for channel in DIGEST_CHANNELS {
+            assert!(valid_channel(channel), "{channel}");
+        }
+        for foreign in ["app2", "mod_hub", "", "RES"] {
+            assert!(!valid_channel(foreign), "{foreign}");
+        }
+    }
+
+    #[test]
+    fn parse_relay_digest_with_checks_the_channel_and_fields() {
+        let hex = "a".repeat(64);
+        let doc = |channel: &str| {
+            serde_json::json!({
+                "channel": channel,
+                "tag": "res-latest",
+                "seq": 7,
+                "assets": { "wowsp-res.json": hex },
+            })
+        };
+        // The unsigned transition's key table isolates field checks from
+        // the signature layer.
+        let parsed = parse_relay_digest_with(&doc("res"), &[], "res").unwrap();
+        assert_eq!(parsed.tag, "res-latest");
+        assert_eq!(parsed.seq, 7);
+        assert_eq!(parsed.asset("wowsp-res.json").unwrap(), hex);
+        // Foreign channel (either side of the check).
+        assert!(parse_relay_digest_with(&doc("res"), &[], "data").is_err());
+        assert!(parse_relay_digest_with(&doc("data"), &[], "res").is_err());
+        // Malformed tag, missing assets, zero/missing seq.
+        let bad_tag = serde_json::json!({
+            "channel": "res", "tag": "res-latest/../x", "seq": 1,
+            "assets": { "wowsp-res.json": hex },
+        });
+        assert!(parse_relay_digest_with(&bad_tag, &[], "res").is_err());
+        let no_assets = serde_json::json!({
+            "channel": "res", "tag": "res-latest", "seq": 1,
+        });
+        assert!(parse_relay_digest_with(&no_assets, &[], "res").is_err());
+        for seq in [serde_json::json!(0), serde_json::Value::Null] {
+            let zeroed = serde_json::json!({
+                "channel": "res", "tag": "res-latest", "seq": seq,
+                "assets": { "wowsp-res.json": hex },
+            });
+            assert!(parse_relay_digest_with(&zeroed, &[], "res").is_err());
+        }
+        // The asset lookup is strict about shape and spelling.
+        let parsed = parse_relay_digest_with(&doc("res"), &[], "res").unwrap();
+        assert!(parsed.asset("wowsp-res.tar.gz").is_err(), "missing entry");
+        let prefixed = serde_json::json!({
+            "channel": "res", "tag": "res-latest", "seq": 1,
+            "assets": { "wowsp-res.json": format!("sha256:{hex}") },
+        });
+        let parsed = parse_relay_digest_with(&prefixed, &[], "res").unwrap();
+        assert!(
+            parsed.asset("wowsp-res.json").is_err(),
+            "the relay spelling is bare hex — a prefixed digest is a shape error"
+        );
+    }
+
+    #[test]
+    fn relay_seq_marks_are_namespaced_by_channel() {
+        // The app channel keeps its already-deployed file name.
+        assert_eq!(relay_seq_file("app"), ".relay-digest-seq.json");
+        assert_eq!(relay_seq_file("res"), ".relay-digest-seq-res.json");
+        assert_eq!(relay_seq_file("mod-hub"), ".relay-digest-seq-mod-hub.json");
+        assert_eq!(relay_seq_file("data"), ".relay-digest-seq-data.json");
+    }
+
+    #[test]
+    fn relay_seq_only_advances() {
+        assert!(ensure_seq_advances(None, 1).is_ok());
+        assert!(ensure_seq_advances(Some(4), 5).is_ok());
+        // Equal is a replay, lower is a revert — both refused.
+        assert!(ensure_seq_advances(Some(4), 4).is_err());
+        let reverted = ensure_seq_advances(Some(9), 2).unwrap_err().to_string();
+        assert!(reverted.contains("regressed"), "{reverted}");
+    }
+
+    #[test]
+    fn choose_official_cross_checks_the_channels() {
+        let a = "8d88e539c25d9b8a0705c9f858f616e68f6d8ef13af4de7a00af39fb10593927".to_string();
+        let b = "b".repeat(64);
+        let ok = |s: String| Ok(s);
+        let err = || Err(anyhow!("unreachable"));
+
+        // Agreement passes; either channel alone suffices.
+        assert_eq!(
+            choose_official(ok(a.clone()), ok(a.clone()), |s| s[..8].to_string()).unwrap(),
+            a
+        );
+        assert_eq!(
+            choose_official(ok(a.clone()), err(), |s| s[..8].to_string()).unwrap(),
+            a
+        );
+        assert_eq!(
+            choose_official(err(), ok(a.clone()), |s| s[..8].to_string()).unwrap(),
+            a
+        );
+        // Disagreement is a hard refusal naming both sides.
+        let refused = choose_official(ok(a), ok(b), |s| s[..8].to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("disagree"), "{refused}");
+        assert!(refused.contains("8d88e539"), "{refused}");
+        // Neither channel leaves only the error to report/retry.
+        assert!(choose_official(err(), err(), |s| s[..8].to_string()).is_err());
+    }
+
+    #[test]
+    fn relay_leg_downgrades_stale_tags_and_missing_entries() {
+        let hex = "a".repeat(64);
+        let doc = |tag: &str, assets: &[(&str, &str)]| RelayDigestDoc {
+            tag: tag.to_string(),
+            assets: assets
+                .iter()
+                .map(|(n, s)| ((*n).to_string(), (*s).to_string()))
+                .collect(),
+            seq: 5,
+        };
+        // A doc naming another tag is stale (GitHub retags in place, the
+        // relay push lands after the upload) — Err, so the GitHub leg
+        // decides; never a fallback by itself.
+        let stale = doc("res-latest-old", &[("wowsp-res.json", &hex)]);
+        assert!(relay_leg_sha("res", stale, "res-latest", "wowsp-res.json").is_err());
+        // A doc without an entry for the asset (images-only publish) or
+        // with a malformed one: same downgrade.
+        let missing = doc("res-latest", &[]);
+        assert!(relay_leg_sha("res", missing, "res-latest", "wowsp-res.json").is_err());
+        let malformed = doc("res-latest", &[("wowsp-res.json", "sha256:abc")]);
+        assert!(relay_leg_sha("res", malformed, "res-latest", "wowsp-res.json").is_err());
+        // A healthy doc yields the asset's sha.
+        let healthy = doc("res-latest", &[("wowsp-res.json", &hex)]);
+        let (_, sha) = relay_leg_sha("res", healthy, "res-latest", "wowsp-res.json").unwrap();
+        assert_eq!(sha, hex);
+    }
+
+    #[test]
+    fn pinned_lookup_splits_ops_gaps_from_attacks() {
+        let hex = "b".repeat(64);
+        let asset = "wowsp-res-delta.tar.gz";
+        let doc = |tag: &str| {
+            serde_json::json!({
+                "channel": "res", "tag": tag, "seq": 2,
+                "assets": { asset: hex },
+            })
+        };
+        // Ops gaps keep the caller's other digest source.
+        assert_eq!(
+            pinned_sha_from_doc(&doc("res-delta-a-b"), &[], "res", "res-delta-a-b", asset).unwrap(),
+            Some(hex.clone())
+        );
+        let no_entry = serde_json::json!({
+            "channel": "res", "tag": "res-delta-a-b", "seq": 2,
+            "assets": { "other.zip": hex.clone() },
+        });
+        assert_eq!(
+            pinned_sha_from_doc(&no_entry, &[], "res", "res-delta-a-b", asset).unwrap(),
+            None,
+            "a doc without the asset is an ops gap, not an attack"
+        );
+        // A doc pinned under another tag, or on another channel, refuses.
+        assert!(
+            pinned_sha_from_doc(&doc("res-delta-c-d"), &[], "res", "res-delta-a-b", asset).is_err()
+        );
+        assert!(
+            pinned_sha_from_doc(&doc("res-delta-a-b"), &[], "data", "res-delta-a-b", asset)
+                .is_err()
+        );
+        // Tampering with a signed doc refuses — never a silent downgrade.
+        let mut tampered = signed_digest_fixture();
+        tampered["assets"]["WoWSP_0.6.0_x64-installer-lite.exe"] = "c".repeat(64).into();
+        assert!(
+            pinned_sha_from_doc(
+                &tampered,
+                &[TEST_DIGEST_KEY],
+                "app",
+                "v0.6.0",
+                "WoWSP_0.6.0_x64-installer-lite.exe"
+            )
+            .is_err()
+        );
+    }
+
+    /// A throwaway keypair (seed bytes 0..32) whose signature below was
+    /// produced by scripts/catalog_signing.py's canonical form — the
+    /// cross-language parity fixture. NOT a trust anchor.
+    const TEST_DIGEST_KEY: (&str, &str) = ("test", "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=");
+
+    fn signed_digest_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "channel": "app",
+            "tag": "v0.6.0",
+            "seq": 3,
+            "generated_at": "2026-10-14T12:00:00Z",
+            "assets": {
+                "WoWSP_0.6.0_x64-installer-lite.exe":
+                    "8d88e539c25d9b8a0705c9f858f616e68f6d8ef13af4de7a00af39fb10593927"
+            },
+            "key_id": "test",
+            "sig": "oX05q6v+4ScQSmS08ryM0/ptDB4a3pL7N+eodLZfs4MbMok9j6eK1+20XM2NvB7wCl97zg5hEzfv4E5qaWj7BQ=="
+        })
+    }
+
+    #[test]
+    fn relay_digest_signature_verifies_across_languages() {
+        let keys = [TEST_DIGEST_KEY];
+        // The python-signed fixture parses AND verifies: this is the
+        // canonical-bytes parity proof (sorted-key compact JSON).
+        let parsed = parse_relay_digest_with(&signed_digest_fixture(), &keys, "app").unwrap();
+        assert_eq!(parsed.seq, 3);
+        assert_eq!(parsed.tag, "v0.6.0");
+
+        // Any tampering of a signed member breaks the signature.
+        let mut tampered_seq = signed_digest_fixture();
+        tampered_seq["seq"] = 4u64.into();
+        let err = parse_relay_digest_with(&tampered_seq, &keys, "app")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not verify"), "{err}");
+
+        // Unknown key ids are refused even with a valid signature.
+        let mut wrong_key = signed_digest_fixture();
+        wrong_key["key_id"] = "other".into();
+        assert!(parse_relay_digest_with(&wrong_key, &keys, "app").is_err());
+
+        // Half-signed is refused.
+        let mut half = signed_digest_fixture();
+        half.as_object_mut().unwrap().remove("sig");
+        assert!(parse_relay_digest_with(&half, &keys, "app").is_err());
+        let mut other_half = signed_digest_fixture();
+        other_half.as_object_mut().unwrap().remove("key_id");
+        assert!(parse_relay_digest_with(&other_half, &keys, "app").is_err());
+
+        // Unsigned: refused while keys are pinned, accepted in the
+        // no-keys-pinned transition (tests only — production pins).
+        let mut unsigned = signed_digest_fixture();
+        unsigned.as_object_mut().unwrap().remove("sig");
+        unsigned.as_object_mut().unwrap().remove("key_id");
+        let refused = parse_relay_digest_with(&unsigned, &keys, "app")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("unsigned"), "{refused}");
+        assert!(parse_relay_digest_with(&unsigned, &[], "app").is_ok());
     }
 }

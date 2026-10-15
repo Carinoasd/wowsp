@@ -9,11 +9,12 @@
 //! `mods/installed.json` for uninstall and (later) game-update migration.
 //!
 //! Trust chain: the index itself may arrive through a third-party mirror,
-//! so its bytes are checked against the digest GitHub publishes for the
-//! `mod-index.json` asset (read from `api.github.com` directly, see
-//! [`super::release_digest`]); only a verified index is cached, and only
-//! packages that the verified index pins with a sha256 and that live on
-//! this repo's release download tree are installable.
+//! so its bytes are checked against the official digest of the
+//! `mod-index.json` asset (the pairing relay's signed doc, cross-checked
+//! with `api.github.com` — see [`super::release_digest`]); only a
+//! verified index is cached, and only packages that the verified index
+//! pins with a sha256 and that live on this repo's release download tree
+//! are installable.
 //!
 //! Package downloads stream through the unified download hub (mirror
 //! ladder + resume + the global proxy-aware client), progress flows on
@@ -46,7 +47,9 @@ use crate::paths;
 /// read again and are removed after the next verified refresh.
 const INDEX_CACHE_FILE: &str = "mod-catalog-verified.json";
 const LEGACY_INDEX_CACHE_FILE: &str = "mod-catalog.json";
-/// Release tag + asset name of the published index.
+/// Release tag + asset name of the published index, and the relay
+/// digest channel serving its official sha256.
+const INDEX_CHANNEL: &str = "mod-hub";
 const INDEX_TAG: &str = "mod-hub";
 const INDEX_ASSET: &str = "mod-index.json";
 const LEDGER_FILE: &str = "mods/installed.json";
@@ -206,13 +209,15 @@ pub(crate) fn load_cached_index() -> Option<CatalogIndex> {
 
 async fn fetch_index() -> anyhow::Result<CatalogIndex> {
     let client = super::network::build_http_client()?;
-    // The official digest comes first, straight from api.github.com: a
-    // mirror could otherwise forge the index together with every package
-    // hash inside it. No digest → no refresh (the caller keeps serving the
-    // last verified cache).
-    let expected = release_digest::fetch_official_sha256(&client, INDEX_TAG, INDEX_ASSET)
-        .await
-        .map_err(|e| anyhow!("catalog index cannot be verified: {e}"))?;
+    // The official digest comes first, over the two channels the payload
+    // mirrors can influence neither (the pairing relay's signed doc,
+    // cross-checked with api.github.com): a mirror could otherwise forge
+    // the index together with every package hash inside it. No digest →
+    // no refresh (the caller keeps serving the last verified cache).
+    let expected =
+        release_digest::fetch_official_sha256(&client, INDEX_CHANNEL, INDEX_TAG, INDEX_ASSET)
+            .await
+            .map_err(|e| anyhow!("catalog index cannot be verified: {e}"))?;
     let mut last_err = String::from("no index url attempted");
     for url in index_urls() {
         let resp = client

@@ -15,10 +15,11 @@
 //!     GitHub fetch, compares the manifest sha against the locally cached
 //!     copy and downloads only on a real content change — republishing
 //!     identical content is a no-op for clients. The manifest body must
-//!     match the digest GitHub publishes for `wowsp-data.json`, read from
-//!     `api.github.com` directly (see [`super::release_digest`]); only an
-//!     unreachable or rate-limited API lets the mirror-served manifest
-//!     through unverified (logged — the kit is data, never executed);
+//!     match the official digest of `wowsp-data.json` (the pairing
+//!     relay's signed doc, cross-checked with `api.github.com` — see
+//!     [`super::release_digest`]); only when BOTH official channels are
+//!     unreachable or rate-limited does the mirror-served manifest pass
+//!     unverified (logged — the kit is data, never executed);
 //!   - [`get_ship_kit`] hands the webui the cached kit JSON,
 //!     hash-verified against the sidecar, to overlay onto its bundled
 //!     copy; a missing or corrupt cache simply means "keep the baked
@@ -44,6 +45,8 @@ use super::download_hub::{self, DownloadRequest};
 use super::release_digest::{self, OfficialDigest, sha256_hex};
 
 const REPO: &str = "langyo/wowsp";
+/// The relay digest channel serving the data pack's official sha256s.
+const DATA_CHANNEL: &str = "data";
 const DATA_TAG: &str = "data-latest";
 const DATA_MANIFEST: &str = "wowsp-data.json";
 /// The one dataset this shell knows today: the Tab overlay's consumable
@@ -117,13 +120,20 @@ fn data_url(asset: &str) -> String {
 /// old version into the check, and a 200-with-garbage answer — the
 /// ghproxy interstitial page — falls through to the next candidate
 /// instead of failing the pass). The body must match the official digest
-/// of the manifest asset — it carries every dataset's sha256, so a mirror
-/// able to rewrite it could also swap the datasets. Only an unreachable or
-/// rate-limited API lets the mirror-served manifest through unverified.
+/// of the manifest asset (the pairing relay's signed doc first,
+/// cross-checked with api.github.com) — it carries every dataset's
+/// sha256, so a mirror able to rewrite it could also swap the datasets.
+/// Only when BOTH official channels are unreachable or rate-limited does
+/// the mirror-served manifest pass unverified.
 async fn fetch_manifest(client: &reqwest::Client) -> anyhow::Result<DataManifest> {
-    let expected = match release_digest::lookup_official_sha256(client, DATA_TAG, DATA_MANIFEST)
-        .await
-        .map_err(|e| anyhow!("data pack manifest cannot be verified: {e}"))?
+    let expected = match release_digest::lookup_official_sha256(
+        client,
+        DATA_CHANNEL,
+        DATA_TAG,
+        DATA_MANIFEST,
+    )
+    .await
+    .map_err(|e| anyhow!("data pack manifest cannot be verified: {e}"))?
     {
         OfficialDigest::Verified(sha) => Some(sha),
         OfficialDigest::Unavailable(reason) => {

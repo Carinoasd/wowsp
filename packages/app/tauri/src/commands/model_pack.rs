@@ -28,15 +28,19 @@
 //! China networks can pin a working prefix instead of waiting out the dead
 //! direct attempt.
 //!
-//! Integrity anchors: the manifest is checked against the digest GitHub
-//! publishes for `wowsp-res.json`, the delta list and each delta archive's
-//! digest come straight from `api.github.com` (see
+//! Integrity anchors: the manifest is checked against the official
+//! digest of `wowsp-res.json`, the delta list and each delta archive's
+//! digest come from the official channels (the pairing relay's signed
+//! docs, cross-checked with `api.github.com` — see
 //! [`super::release_digest`]), and a patched tree is re-hashed and must
 //! reproduce the manifest's tree hash before it is published. An official
-//! digest that was obtained is binding. Only when the API is unreachable
-//! or rate limited does the pack fall back to the mirror-served manifest
-//! and delta list (logged as a warning): the pack is content, never
-//! executed, and a first install must not depend on api.github.com.
+//! digest that was obtained is binding. The manifest falls back to the
+//! mirror-served copy only when BOTH official channels are unreachable
+//! or rate limited (logged as a warning): the pack is content, never
+//! executed, and a first install must not depend on api.github.com. The
+//! delta list falls back to the mirror ladder only when the GitHub
+//! release API is unavailable, and every such edge's digest is then
+//! re-taken from the relay's signed per-tag doc when obtainable.
 //!
 //! Extraction and patch application prepare a separate `.res-staging`
 //! tree while the current pack keeps serving. Publishing backs up the old
@@ -96,6 +100,9 @@ use crate::commands::release_digest::{ApiLookup, OfficialDigest};
 use crate::paths;
 
 const REPO: &str = "langyo/wowsp";
+/// The relay digest channel serving the resource pack's official
+/// sha256s (full release and every `res-delta-*` tag).
+const RES_CHANNEL: &str = "res";
 /// The fixed, single release tag the resource pack publishes under.
 const RES_TAG: &str = "res-latest";
 /// Full-pack asset name (top-level `models/` + `dogtags/` + optional
@@ -329,13 +336,15 @@ fn release_download_url(asset: &str) -> String {
 /// Download the manifest asset (a small JSON file) across the mirror
 /// ladder. `Cache-Control: no-cache` keeps mirror-cached copies from
 /// pinning an old version into the check. The body must match the
-/// official digest of `wowsp-res.json` (fetched from api.github.com
-/// first): the manifest carries the archive's sha256, so a mirror that
-/// could rewrite it could also swap the archive. Only an unreachable or
-/// rate-limited API lets the mirror-served manifest through unverified.
+/// official digest of `wowsp-res.json` (the pairing relay's signed doc
+/// first, cross-checked with api.github.com): the manifest carries the
+/// archive's sha256, so a mirror that could rewrite it could also swap
+/// the archive. Only when BOTH official channels are unreachable or
+/// rate-limited does the mirror-served manifest pass unverified.
 async fn fetch_manifest(client: &Client) -> anyhow::Result<ResManifest> {
     let expected = match super::release_digest::lookup_official_sha256(
         client,
+        RES_CHANNEL,
         RES_TAG,
         RES_MANIFEST,
     )
@@ -396,26 +405,85 @@ fn parse_delta_tag(tag: &str) -> Option<(String, String)> {
     Some((from.to_string(), to.to_string()))
 }
 
+/// The release tag of one delta edge (the inverse of
+/// [`parse_delta_tag`]).
+fn delta_tag(from: &str, to: &str) -> String {
+    format!("{DELTA_TAG_PREFIX}{from}-{to}")
+}
+
 /// Query the repo's release list and collect every delta edge whose patch
 /// asset exists. The list API is paged; one page of 100 comfortably holds
 /// the app releases plus the three retained deltas. The list comes straight
 /// from api.github.com: it supplies each archive's official digest, which a
 /// mirror-served list could forge. An unreachable or rate-limited API
-/// falls back to the list through the mirror ladder (logged); the patched
-/// tree must still reproduce the manifest's tree hash before it is used.
+/// falls back to the list through the mirror ladder (logged) — and then
+/// every edge whose digest the relay's signed per-tag doc can supply gets
+/// that digest instead (see [`harden_edges_against_the_relay`]); the
+/// patched tree must still reproduce the manifest's tree hash before it
+/// is used.
 async fn fetch_delta_edges(client: &Client) -> anyhow::Result<Vec<DeltaEdge>> {
     let api_url = super::release_digest::releases_api_url();
-    let releases = match super::release_digest::lookup_api_json(client, &api_url).await? {
-        ApiLookup::Found(releases) => releases,
+    match super::release_digest::lookup_api_json(client, &api_url).await? {
+        ApiLookup::Found(releases) => Ok(delta_edges_from_releases(&releases)),
         ApiLookup::Unavailable(reason) => {
             tracing::warn!(
                 %reason,
                 "release API unavailable — reading the delta list through the mirror ladder"
             );
-            fetch_release_list_via_mirrors(client, &api_url).await?
+            let releases = fetch_release_list_via_mirrors(client, &api_url).await?;
+            let mut edges = delta_edges_from_releases(&releases);
+            harden_edges_against_the_relay(client, &mut edges).await?;
+            Ok(edges)
         },
-    };
-    Ok(delta_edges_from_releases(&releases))
+    }
+}
+
+/// Replace mirror-served edge digests with the relay's signed ones. This
+/// runs only on the mirror-ladder fallback, where the release list — and
+/// every edge digest inside it — was supplied by a mirror: the relay's
+/// pinned per-tag docs are official, so each edge whose doc the relay can
+/// serve has its sha256 replaced outright (a mismatch with the mirror's
+/// spelling is expected — the mirror was never trusted). Edges the relay
+/// cannot serve right now keep the mirror digest, logged; the patched
+/// tree still has to reproduce the manifest's tree hash. A doc that DOES
+/// answer but fails its signature fails the whole discovery (the full
+/// archive is the fallback), never a silent downgrade.
+async fn harden_edges_against_the_relay(
+    client: &Client,
+    edges: &mut [DeltaEdge],
+) -> anyhow::Result<()> {
+    let lookups = edges
+        .iter()
+        .map(|edge| {
+            let tag = delta_tag(&edge.from, &edge.to);
+            async move {
+                super::release_digest::relay_pinned_sha256(client, RES_CHANNEL, &tag, DELTA_ARCHIVE)
+                    .await
+            }
+        })
+        .collect::<Vec<_>>();
+    let results = futures::future::join_all(lookups).await;
+    for (edge, result) in edges.iter_mut().zip(results) {
+        let tag = delta_tag(&edge.from, &edge.to);
+        match result? {
+            Some(official) => {
+                if edge.sha256 != official {
+                    tracing::warn!(
+                        %tag,
+                        "replacing the mirror-served delta digest with the relay's signed one"
+                    );
+                    edge.sha256 = official;
+                }
+            },
+            None => {
+                tracing::warn!(
+                    %tag,
+                    "relay digest unavailable — keeping the mirror-served delta digest"
+                );
+            },
+        }
+    }
+    Ok(())
 }
 
 /// The release list through the mirror ladder (the pre-digest route, kept
@@ -2077,6 +2145,15 @@ mod tests {
     #[test]
     fn delta_tags_parse_into_hash_pairs() {
         let tag = format!("res-delta-{}-{}", hash(1), hash(2));
+        assert_eq!(parse_delta_tag(&tag), Some((hash(1), hash(2))));
+    }
+
+    #[test]
+    fn delta_tags_round_trip() {
+        // The relay hardening reconstructs a tag from an edge's hashes;
+        // the pair must survive both directions exactly.
+        let tag = delta_tag(&hash(1), &hash(2));
+        assert_eq!(tag, format!("res-delta-{}-{}", hash(1), hash(2)));
         assert_eq!(parse_delta_tag(&tag), Some((hash(1), hash(2))));
     }
 
